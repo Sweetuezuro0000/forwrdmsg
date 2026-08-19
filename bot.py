@@ -1,13 +1,14 @@
+import asyncio
+
+asyncio.set_event_loop(asyncio.new_event_loop())
+
 import os
 import re
-import asyncio
 import sqlite3
 
 from aiohttp import web
-
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
-
 
 # =========================================================
 # ENV
