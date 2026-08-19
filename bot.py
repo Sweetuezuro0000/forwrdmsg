@@ -1,14 +1,16 @@
-import asyncio
-
-asyncio.set_event_loop(asyncio.new_event_loop())
-
 import os
 import re
+import asyncio
 import sqlite3
 
 from aiohttp import web
+
+# Python 3.14 + Pyrogram compatibility
+asyncio.set_event_loop(asyncio.new_event_loop())
+
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
+
 
 # =========================================================
 # ENV
@@ -20,18 +22,17 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 PORT = int(os.environ.get("PORT", "10000"))
 
-DB_FILE = "bulk_manager.db"
-
 
 # =========================================================
-# PYROGRAM
+# PYROGRAM CLIENT
 # =========================================================
 
 app = Client(
     "bulk_manager_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True
 )
 
 
@@ -48,8 +49,8 @@ def default_config():
         "suffix": "",
         "replace_from": "",
         "replace_to": "",
-        "caption": None,
-        "caption_mode": "keep",
+        "old_chat": "",
+        "new_chat": ""
     }
 
 
@@ -64,22 +65,19 @@ def get_config(user_id):
 # DATABASE
 # =========================================================
 
-def db():
-    return sqlite3.connect(DB_FILE)
+DB_FILE = "link_mapping.db"
 
 
 def init_db():
+    conn = sqlite3.connect(DB_FILE)
 
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS message_map (
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mappings (
             source_chat TEXT NOT NULL,
-            source_message INTEGER NOT NULL,
+            source_msg_id INTEGER NOT NULL,
             target_chat TEXT NOT NULL,
-            target_message INTEGER NOT NULL,
-            PRIMARY KEY(source_chat, source_message)
+            target_msg_id INTEGER NOT NULL,
+            PRIMARY KEY(source_chat, source_msg_id)
         )
     """)
 
@@ -89,50 +87,39 @@ def init_db():
 
 def save_mapping(
     source_chat,
-    source_message,
+    source_msg_id,
     target_chat,
-    target_message
+    target_msg_id
 ):
+    conn = sqlite3.connect(DB_FILE)
 
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT OR REPLACE INTO message_map
-        (
-            source_chat,
-            source_message,
-            target_chat,
-            target_message
-        )
+    conn.execute("""
+        INSERT OR REPLACE INTO mappings
+        (source_chat, source_msg_id, target_chat, target_msg_id)
         VALUES (?, ?, ?, ?)
     """, (
         str(source_chat),
-        int(source_message),
+        int(source_msg_id),
         str(target_chat),
-        int(target_message)
+        int(target_msg_id)
     ))
 
     conn.commit()
     conn.close()
 
 
-def get_mapping(source_chat, source_message):
+def get_mapping(source_chat, source_msg_id):
+    conn = sqlite3.connect(DB_FILE)
 
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT target_message
-        FROM message_map
+    row = conn.execute("""
+        SELECT target_msg_id
+        FROM mappings
         WHERE source_chat = ?
-        AND source_message = ?
+        AND source_msg_id = ?
     """, (
         str(source_chat),
-        int(source_message)
-    ))
-
-    row = cur.fetchone()
+        int(source_msg_id)
+    )).fetchone()
 
     conn.close()
 
@@ -140,116 +127,92 @@ def get_mapping(source_chat, source_message):
 
 
 # =========================================================
-# TELEGRAM INTERNAL LINK
+# CONTENT PROCESSING
 # =========================================================
 
-def normalize_chat_id(chat_id):
-    """
-    Converts:
-    -1001234567890
-    into:
-    1234567890
-    """
-
-    value = str(chat_id)
-
-    if value.startswith("-100"):
-        return value[4:]
-
-    return value
-
-
-def build_message_link(chat_id, message_id):
-
-    internal_id = normalize_chat_id(chat_id)
-
-    return f"https://t.me/c/{internal_id}/{message_id}"
-
-
-# =========================================================
-# LINK REPLACEMENT
-# =========================================================
-
-INTERNAL_LINK_RE = re.compile(
-    r"https?://t\.me/c/(\d+)/(\d+)"
-)
-
-
-def replace_internal_links(
-    text,
-    source_chat,
-    target_chat
-):
-
+def process_content(text, entities, config, source_chat):
     if not text:
-        return text
+        return text, entities
 
-    def replacer(match):
+    original_text = text
 
-        linked_chat = match.group(1)
-        linked_message = int(match.group(2))
+    # -------------------------
+    # TEXT REPLACE
+    # -------------------------
 
-        source_chat_clean = normalize_chat_id(source_chat)
-
-        if linked_chat != source_chat_clean:
-            return match.group(0)
-
-        target_message = get_mapping(
-            source_chat,
-            linked_message
-        )
-
-        if not target_message:
-            return match.group(0)
-
-        return build_message_link(
-            target_chat,
-            target_message
-        )
-
-    return INTERNAL_LINK_RE.sub(
-        replacer,
-        text
-    )
-
-
-# =========================================================
-# TEXT PROCESSING
-# =========================================================
-
-def process_text(
-    text,
-    config,
-    source_chat,
-    target_chat
-):
-
-    if text is None:
-        return None
-
-    # Replace text
     if config["replace_from"]:
         text = text.replace(
             config["replace_from"],
             config["replace_to"]
         )
 
-    # Internal Telegram links
-    text = replace_internal_links(
-        text,
-        source_chat,
-        target_chat
+    # -------------------------
+    # INTERNAL TELEGRAM LINKS
+    # -------------------------
+
+    old_chat = config["old_chat"]
+    new_chat = config["new_chat"]
+
+    if old_chat and new_chat:
+
+        pattern = (
+            r"https?://(?:t\.me|telegram\.me)/"
+            r"(c/\d+|[A-Za-z0-9_]+)/(\d+)"
+        )
+
+        def replace_link(match):
+
+            chat_part = match.group(1)
+            msg_id = int(match.group(2))
+
+            # Check whether this is the configured source chat
+            if chat_part != old_chat:
+                return match.group(0)
+
+            mapped_id = get_mapping(
+                source_chat,
+                msg_id
+            )
+
+            if mapped_id is None:
+                return match.group(0)
+
+            return f"https://t.me/{new_chat}/{mapped_id}"
+
+        text = re.sub(
+            pattern,
+            replace_link,
+            text
+        )
+
+    # -------------------------
+    # PREFIX / SUFFIX
+    # -------------------------
+
+    prefix = config["prefix"]
+    suffix = config["suffix"]
+
+    final_text = (
+        prefix +
+        text +
+        suffix
     )
 
-    # Prefix
-    if config["prefix"]:
-        text = config["prefix"] + text
+    # Shift entities because of prefix
+    adjusted_entities = []
 
-    # Suffix
-    if config["suffix"]:
-        text = text + config["suffix"]
+    if entities:
 
-    return text
+        for entity in entities:
+
+            try:
+                entity.offset += len(prefix)
+            except Exception:
+                pass
+
+            adjusted_entities.append(entity)
+
+    return final_text, adjusted_entities
 
 
 # =========================================================
@@ -257,30 +220,27 @@ def process_text(
 # =========================================================
 
 @app.on_message(filters.command("start"))
-async def start(_, message):
+async def start_command(client, message):
+
+    print(
+        f"START RECEIVED from "
+        f"{message.from_user.id if message.from_user else 'unknown'}",
+        flush=True
+    )
 
     await message.reply_text(
-        "🚀 **Bulk Manager Bot**\n\n"
+        "🚀 Advanced Bulk Content Manager Bot Active!\n\n"
 
-        "**Bulk Transfer**\n"
-        "`/clone source target from_id to_id src_topic target_topic`\n\n"
+        "⚙️ Configuration:\n"
+        "/setprefix text\n"
+        "/setsuffix text\n"
+        "/setreplace old | new\n"
+        "/setlink old_chat | new_chat\n"
+        "/status\n"
+        "/reset\n\n"
 
-        "**Caption**\n"
-        "`/setprefix text`\n"
-        "`/setsuffix text`\n"
-        "`/setcaption text`\n"
-        "`/removecaption`\n"
-        "`/keepcaption`\n\n"
-
-        "**Text**\n"
-        "`/setreplace old | new`\n\n"
-
-        "**Other**\n"
-        "`/status`\n"
-        "`/reset`\n\n"
-
-        "Example:\n"
-        "`/clone -1001111111111 -1002222222222 100 500 123 456`"
+        "📦 Bulk Transfer:\n"
+        "/clone Source Target From_ID To_ID Src_Topic_ID Tgt_Topic_ID"
     )
 
 
@@ -289,26 +249,24 @@ async def start(_, message):
 # =========================================================
 
 @app.on_message(filters.command("setprefix"))
-async def setprefix(_, message):
+async def set_prefix(client, message):
 
     if len(message.command) < 2:
-
         await message.reply_text(
-            "Usage:\n`/setprefix Your Text`"
+            "Usage:\n/setprefix Your text"
         )
-
         return
 
-    config = get_config(
-        message.from_user.id
-    )
-
-    config["prefix"] = message.text.split(
+    value = message.text.split(
         maxsplit=1
     )[1]
 
+    get_config(
+        message.from_user.id
+    )["prefix"] = value
+
     await message.reply_text(
-        "✅ Prefix updated."
+        f"✅ Prefix set:\n{value}"
     )
 
 
@@ -317,111 +275,38 @@ async def setprefix(_, message):
 # =========================================================
 
 @app.on_message(filters.command("setsuffix"))
-async def setsuffix(_, message):
+async def set_suffix(client, message):
 
     if len(message.command) < 2:
-
         await message.reply_text(
-            "Usage:\n`/setsuffix Your Text`"
+            "Usage:\n/setsuffix Your text"
         )
-
         return
 
-    config = get_config(
-        message.from_user.id
-    )
-
-    config["suffix"] = message.text.split(
+    value = message.text.split(
         maxsplit=1
     )[1]
 
-    await message.reply_text(
-        "✅ Suffix updated."
-    )
-
-
-# =========================================================
-# SET CAPTION
-# =========================================================
-
-@app.on_message(filters.command("setcaption"))
-async def setcaption(_, message):
-
-    if len(message.command) < 2:
-
-        await message.reply_text(
-            "Usage:\n`/setcaption New Caption`"
-        )
-
-        return
-
-    config = get_config(
+    get_config(
         message.from_user.id
-    )
-
-    config["caption"] = message.text.split(
-        maxsplit=1
-    )[1]
-
-    config["caption_mode"] = "replace"
+    )["suffix"] = value
 
     await message.reply_text(
-        "✅ Caption replacement enabled."
+        f"✅ Suffix set:\n{value}"
     )
 
 
 # =========================================================
-# REMOVE CAPTION
-# =========================================================
-
-@app.on_message(filters.command("removecaption"))
-async def removecaption(_, message):
-
-    config = get_config(
-        message.from_user.id
-    )
-
-    config["caption"] = ""
-    config["caption_mode"] = "remove"
-
-    await message.reply_text(
-        "✅ Captions will be removed."
-    )
-
-
-# =========================================================
-# KEEP CAPTION
-# =========================================================
-
-@app.on_message(filters.command("keepcaption"))
-async def keepcaption(_, message):
-
-    config = get_config(
-        message.from_user.id
-    )
-
-    config["caption"] = None
-    config["caption_mode"] = "keep"
-
-    await message.reply_text(
-        "✅ Original captions will be kept."
-    )
-
-
-# =========================================================
-# REPLACE TEXT
+# REPLACE
 # =========================================================
 
 @app.on_message(filters.command("setreplace"))
-async def setreplace(_, message):
+async def set_replace(client, message):
 
     if len(message.command) < 2:
-
         await message.reply_text(
-            "Usage:\n"
-            "`/setreplace old text | new text`"
+            "Usage:\n/setreplace old | new"
         )
-
         return
 
     value = message.text.split(
@@ -429,12 +314,9 @@ async def setreplace(_, message):
     )[1]
 
     if " | " not in value:
-
         await message.reply_text(
-            "❌ Use:\n"
-            "`/setreplace old | new`"
+            "Usage:\n/setreplace old | new"
         )
-
         return
 
     old, new = value.split(
@@ -446,11 +328,58 @@ async def setreplace(_, message):
         message.from_user.id
     )
 
-    config["replace_from"] = old
-    config["replace_to"] = new
+    config["replace_from"] = old.strip()
+    config["replace_to"] = new.strip()
 
     await message.reply_text(
-        "✅ Text replacement enabled."
+        "✅ Replacement rule saved."
+    )
+
+
+# =========================================================
+# LINK CONFIG
+# =========================================================
+
+@app.on_message(filters.command("setlink"))
+async def set_link(client, message):
+
+    if len(message.command) < 2:
+        await message.reply_text(
+            "Usage:\n/setlink old_chat | new_chat"
+        )
+        return
+
+    value = message.text.split(
+        maxsplit=1
+    )[1]
+
+    if " | " not in value:
+        await message.reply_text(
+            "Usage:\n/setlink old_chat | new_chat"
+        )
+        return
+
+    old, new = value.split(
+        " | ",
+        1
+    )
+
+    config = get_config(
+        message.from_user.id
+    )
+
+    config["old_chat"] = old.strip().replace(
+        "@",
+        ""
+    )
+
+    config["new_chat"] = new.strip().replace(
+        "@",
+        ""
+    )
+
+    await message.reply_text(
+        "✅ Internal link mapping configured."
     )
 
 
@@ -459,21 +388,22 @@ async def setreplace(_, message):
 # =========================================================
 
 @app.on_message(filters.command("status"))
-async def status(_, message):
+async def status(client, message):
 
     config = get_config(
         message.from_user.id
     )
 
-    caption_mode = config["caption_mode"]
-
     await message.reply_text(
-        "📊 **Current Settings**\n\n"
-        f"Prefix: `{config['prefix'] or 'None'}`\n"
-        f"Suffix: `{config['suffix'] or 'None'}`\n"
-        f"Caption mode: `{caption_mode}`\n"
-        f"Caption: `{config['caption'] or 'None'}`\n"
-        f"Replace: `{config['replace_from'] or 'None'}`"
+        "📊 Current Configuration\n\n"
+        f"Prefix: {config['prefix'] or 'None'}\n"
+        f"Suffix: {config['suffix'] or 'None'}\n"
+        f"Replace: "
+        f"{config['replace_from'] or 'None'}"
+        " → "
+        f"{config['replace_to'] or 'None'}\n"
+        f"Old Chat: {config['old_chat'] or 'None'}\n"
+        f"New Chat: {config['new_chat'] or 'None'}"
     )
 
 
@@ -482,34 +412,19 @@ async def status(_, message):
 # =========================================================
 
 @app.on_message(filters.command("reset"))
-async def reset(_, message):
+async def reset(client, message):
 
     USER_CONFIGS[
         message.from_user.id
     ] = default_config()
 
     await message.reply_text(
-        "🔄 Settings reset."
+        "🔄 Configuration reset."
     )
 
 
 # =========================================================
-# GET MESSAGE TEXT/CAPTION
-# =========================================================
-
-def get_content(message):
-
-    if message.text:
-        return message.text
-
-    if message.caption:
-        return message.caption
-
-    return None
-
-
-# =========================================================
-# BULK CLONE
+# CLONE
 # =========================================================
 
 @app.on_message(filters.command("clone"))
@@ -518,13 +433,12 @@ async def clone(client, message):
     args = message.command[1:]
 
     if len(args) < 4:
-
         await message.reply_text(
-            "❌ **Usage:**\n\n"
-            "`/clone source target from_id to_id "
-            "src_topic target_topic`"
+            "Usage:\n"
+            "/clone "
+            "Source Target From_ID To_ID "
+            "Src_Topic_ID Tgt_Topic_ID"
         )
-
         return
 
     source = args[0]
@@ -537,13 +451,13 @@ async def clone(client, message):
 
         src_topic = (
             int(args[4])
-            if len(args) >= 5
+            if len(args) > 4
             else 0
         )
 
-        target_topic = (
+        tgt_topic = (
             int(args[5])
-            if len(args) >= 6
+            if len(args) > 5
             else 0
         )
 
@@ -552,334 +466,214 @@ async def clone(client, message):
         await message.reply_text(
             "❌ IDs must be numbers."
         )
-
         return
 
-    # Convert numeric chat IDs
     if source.lstrip("-").isdigit():
         source = int(source)
 
     if target.lstrip("-").isdigit():
         target = int(target)
 
-    if from_id > to_id:
-
-        await message.reply_text(
-            "❌ From ID must be smaller than To ID."
-        )
-
-        return
-
     config = get_config(
         message.from_user.id
     )
 
-    total = to_id - from_id + 1
+    status_message = await message.reply_text(
+        "🚀 Bulk transfer started..."
+    )
 
     success = 0
     failed = 0
-    skipped = 0
 
-    status = await message.reply_text(
-        "🚀 **Bulk export started...**"
+    total = max(
+        0,
+        to_id - from_id + 1
     )
 
-    # =====================================================
-    # FIRST PASS
-    # Copy messages and save mapping
-    # =====================================================
-
-    for index, msg_id in enumerate(
-        range(from_id, to_id + 1),
-        start=1
-    ):
-
-        try:
-
-            msg = await client.get_messages(
-                source,
-                msg_id
-            )
-
-            if not msg or msg.empty:
-
-                skipped += 1
-                continue
-
-            # ---------------------------------------------
-            # Topic check
-            # ---------------------------------------------
-
-            if src_topic:
-
-                thread_id = (
-                    getattr(
-                        msg,
-                        "message_thread_id",
-                        None
-                    )
-                    or getattr(
-                        msg,
-                        "reply_to_top_message_id",
-                        None
-                    )
-                    or getattr(
-                        msg,
-                        "reply_to_message_id",
-                        None
-                    )
-                )
-
-                if thread_id != src_topic:
-
-                    skipped += 1
-                    continue
-
-            # ---------------------------------------------
-            # COPY
-            # ---------------------------------------------
-
-            copied = None
-
-            # We first copy the original message.
-            # This preserves Telegram formatting.
-            if msg.media:
-
-                copied = await msg.copy(
-                    chat_id=target,
-                    reply_to_message_id=(
-                        target_topic
-                        if target_topic
-                        else None
-                    )
-                )
-
-            elif msg.text:
-
-                copied = await client.send_message(
-                    chat_id=target,
-                    text=msg.text,
-                    entities=msg.entities,
-                    reply_to_message_id=(
-                        target_topic
-                        if target_topic
-                        else None
-                    )
-                )
-
-            else:
-
-                skipped += 1
-                continue
-
-            if copied:
-
-                save_mapping(
-                    source,
-                    msg.id,
-                    target,
-                    copied.id
-                )
-
-                success += 1
-
-        except FloodWait as e:
-
-            await asyncio.sleep(
-                e.value + 2
-            )
-
-            try:
-
-                msg = await client.get_messages(
-                    source,
-                    msg_id
-                )
-
-                if msg and not msg.empty:
-
-                    copied = await msg.copy(
-                        chat_id=target,
-                        reply_to_message_id=(
-                            target_topic
-                            if target_topic
-                            else None
-                        )
-                    )
-
-                    if copied:
-
-                        save_mapping(
-                            source,
-                            msg.id,
-                            target,
-                            copied.id
-                        )
-
-                        success += 1
-
-            except Exception:
-                failed += 1
-
-        except Exception as e:
-
-            failed += 1
-
-            print(
-                f"Clone error {msg_id}: {e}"
-            )
-
-        # ---------------------------------------------
-        # PROGRESS
-        # ---------------------------------------------
-
-        if (
-            index % 5 == 0
-            or index == total
-        ):
-
-            percent = (
-                index / total
-            ) * 100
-
-            try:
-
-                await status.edit_text(
-                    "📦 **Bulk Transfer**\n\n"
-                    f"Progress: `{percent:.1f}%`\n"
-                    f"Processed: `{index}/{total}`\n\n"
-                    f"✅ Copied: `{success}`\n"
-                    f"⏭ Skipped: `{skipped}`\n"
-                    f"❌ Failed: `{failed}`"
-                )
-
-            except Exception:
-                pass
-
-    # =====================================================
-    # SECOND PASS
-    # Fix captions/text/internal links
-    # =====================================================
-
-    await status.edit_text(
-        "🔗 **Updating captions and internal links...**"
-    )
-
-    for msg_id in range(
+    for current_id in range(
         from_id,
         to_id + 1
     ):
 
         try:
 
-            target_id = get_mapping(
-                source,
-                msg_id
-            )
+            # -------------------------
+            # PROGRESS
+            # -------------------------
 
-            if not target_id:
-                continue
+            if (
+                current_id == from_id
+                or
+                (current_id - from_id) % 5 == 0
+            ):
 
-            source_msg = await client.get_messages(
-                source,
-                msg_id
-            )
+                completed = (
+                    current_id - from_id
+                )
 
-            target_msg = await client.get_messages(
-                target,
-                target_id
-            )
+                percentage = (
+                    completed / total * 100
+                    if total
+                    else 100
+                )
 
-            if not source_msg or not target_msg:
-                continue
-
-            original = get_content(
-                source_msg
-            )
-
-            if original is None:
-                continue
-
-            new_content = process_text(
-                original,
-                config,
-                source,
-                target
-            )
-
-            # Caption modification
-            if source_msg.media:
-
-                if config["caption_mode"] == "remove":
-
-                    new_content = ""
-
-                elif config["caption_mode"] == "replace":
-
-                    new_content = config["caption"] or ""
-
-                    new_content = process_text(
-                        new_content,
-                        config,
-                        source,
-                        target
+                try:
+                    await status_message.edit_text(
+                        "⏳ Bulk Transfer\n\n"
+                        f"Message: `{current_id}`\n"
+                        f"Success: `{success}`\n"
+                        f"Failed: `{failed}`\n"
+                        f"Progress: `{percentage:.1f}%`"
                     )
+                except Exception:
+                    pass
 
-                if new_content != original:
+            # -------------------------
+            # GET MESSAGE
+            # -------------------------
 
-                    try:
+            msg = await client.get_messages(
+                source,
+                current_id
+            )
 
-                        await client.edit_message_caption(
-                            target,
-                            target_id,
-                            caption=new_content
-                        )
+            if not msg or msg.empty:
+                failed += 1
+                continue
 
-                    except Exception as e:
+            if getattr(
+                msg,
+                "service",
+                False
+            ):
+                continue
 
-                        print(
-                            f"Caption edit failed "
-                            f"{target_id}: {e}"
-                        )
+            # -------------------------
+            # TOPIC CHECK
+            # -------------------------
 
-            # Text message modification
-            else:
+            thread_id = getattr(
+                msg,
+                "message_thread_id",
+                None
+            )
 
-                if new_content != original:
+            if thread_id is None:
+                thread_id = getattr(
+                    msg,
+                    "reply_to_message_id",
+                    None
+                )
 
-                    try:
+            if (
+                src_topic
+                and thread_id != src_topic
+            ):
+                continue
 
-                        await client.edit_message_text(
-                            target,
-                            target_id,
-                            new_content
-                        )
+            # -------------------------
+            # CONTENT
+            # -------------------------
 
-                    except Exception as e:
+            text = (
+                msg.text
+                or msg.caption
+            )
 
-                        print(
-                            f"Text edit failed "
-                            f"{target_id}: {e}"
-                        )
+            entities = (
+                msg.entities
+                or msg.caption_entities
+            )
+
+            new_text, new_entities = process_content(
+                text,
+                entities,
+                config,
+                str(source).replace("-100", "")
+            )
+
+            # -------------------------
+            # TARGET TOPIC
+            # -------------------------
+
+            reply_to = (
+                tgt_topic
+                if tgt_topic
+                else None
+            )
+
+            # -------------------------
+            # SEND
+            # -------------------------
+
+            copied = None
+
+            if msg.media:
+
+                copied = await msg.copy(
+                    chat_id=target,
+                    caption=new_text,
+                    caption_entities=new_entities,
+                    reply_to_message_id=reply_to
+                )
+
+            elif new_text:
+
+                copied = await client.send_message(
+                    chat_id=target,
+                    text=new_text,
+                    entities=new_entities,
+                    reply_to_message_id=reply_to
+                )
+
+            if copied:
+
+                save_mapping(
+                    str(source).replace("-100", ""),
+                    current_id,
+                    str(target).replace("-100", ""),
+                    copied.id
+                )
+
+                success += 1
+
+            await asyncio.sleep(1.5)
+
+        except FloodWait as e:
+
+            print(
+                f"FloodWait: {e.value}s",
+                flush=True
+            )
+
+            await asyncio.sleep(
+                e.value + 2
+            )
+
+        except RPCError as e:
+
+            failed += 1
+
+            print(
+                f"Telegram RPC error "
+                f"{current_id}: {e}",
+                flush=True
+            )
 
         except Exception as e:
 
+            failed += 1
+
             print(
-                f"Post-process error "
-                f"{msg_id}: {e}"
+                f"Error {current_id}: {e}",
+                flush=True
             )
 
-    # =====================================================
-    # FINISHED
-    # =====================================================
-
-    await status.edit_text(
-        "🏁 **Bulk Export Completed**\n\n"
-        f"📦 Total: `{total}`\n"
-        f"✅ Copied: `{success}`\n"
-        f"⏭ Skipped: `{skipped}`\n"
-        f"❌ Failed: `{failed}`\n\n"
-        "🔗 Internal links processed."
+    await status_message.edit_text(
+        "🏁 Bulk Transfer Completed\n\n"
+        f"✅ Success: `{success}`\n"
+        f"❌ Failed: `{failed}`\n"
+        f"📦 Total: `{total}`"
     )
 
 
@@ -887,7 +681,7 @@ async def clone(client, message):
 # RENDER WEB SERVER
 # =========================================================
 
-async def home(request):
+async def health(request):
 
     return web.Response(
         text="Bulk Manager Bot is running.",
@@ -901,7 +695,7 @@ async def start_web_server():
 
     web_app.router.add_get(
         "/",
-        home
+        health
     )
 
     runner = web.AppRunner(
@@ -919,7 +713,8 @@ async def start_web_server():
     await site.start()
 
     print(
-        f"Web server running on port {PORT}"
+        f"Web server running on port {PORT}",
+        flush=True
     )
 
 
@@ -928,21 +723,39 @@ async def start_web_server():
 # =========================================================
 
 async def main():
+
     init_db()
 
-    print("Starting Pyrogram...", flush=True)
+    print(
+        "Starting Pyrogram...",
+        flush=True
+    )
 
     await app.start()
 
-    print("Pyrogram started successfully.", flush=True)
-    print(f"Bot username: {(await app.get_me()).username}", flush=True)
+    me = await app.get_me()
+
+    print(
+        f"Bot started: @{me.username}",
+        flush=True
+    )
 
     await start_web_server()
 
-    print("Bot is now listening for Telegram messages.", flush=True)
+    print(
+        "Bot is listening for Telegram messages.",
+        flush=True
+    )
 
-    await asyncio.Event().wait()
+    try:
+
+        await asyncio.Event().wait()
+
+    finally:
+
+        await app.stop()
 
 
 if __name__ == "__main__":
+
     asyncio.run(main())
