@@ -928,20 +928,21 @@ async def start_web_server():
 # =========================================================
 
 async def main():
-
     init_db()
+
+    print("Starting Pyrogram...", flush=True)
 
     await app.start()
 
+    print("Pyrogram started successfully.", flush=True)
+    print(f"Bot username: {(await app.get_me()).username}", flush=True)
+
     await start_web_server()
 
-    print(
-        "🚀 Bulk Manager Bot started."
-    )
+    print("Bot is now listening for Telegram messages.", flush=True)
 
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-
     asyncio.run(main())
