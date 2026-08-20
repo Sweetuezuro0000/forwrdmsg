@@ -2,10 +2,15 @@ import os
 import re
 import sqlite3
 import asyncio
+from typing import Optional
+
 from aiohttp import web
 
+from pyrogram import Client
+from pyrogram.enums import MessageEntityType
+from pyrogram.errors import FloodWait, RPCError
+
 from telegram import Update, BotCommand
-from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError, RetryAfter
 from telegram.ext import (
     Application,
@@ -19,7 +24,17 @@ from telegram.ext import (
 # =========================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+
 PORT = int(os.environ.get("PORT", "10000"))
+
+# Pyrogram bot session.
+PYROGRAM_SESSION = os.environ.get(
+    "PYROGRAM_SESSION",
+    "source_reader_bot"
+)
 
 
 # =========================================================
@@ -33,10 +48,16 @@ def default_config():
     return {
         "prefix": "",
         "suffix": "",
+
         "replace_from": "",
         "replace_to": "",
+
         "old_chat": "",
         "new_chat": "",
+
+        "caption_mode": "keep",
+        "caption_replace_from": "",
+        "caption_replace_to": "",
     }
 
 
@@ -55,15 +76,24 @@ DB_FILE = "link_mapping.db"
 
 
 def init_db():
+
     conn = sqlite3.connect(DB_FILE)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mappings (
             source_chat TEXT NOT NULL,
+            source_topic INTEGER NOT NULL DEFAULT 0,
             source_msg_id INTEGER NOT NULL,
+
             target_chat TEXT NOT NULL,
+            target_topic INTEGER NOT NULL DEFAULT 0,
             target_msg_id INTEGER NOT NULL,
-            PRIMARY KEY (source_chat, source_msg_id)
+
+            PRIMARY KEY (
+                source_chat,
+                source_topic,
+                source_msg_id
+            )
         )
     """)
 
@@ -71,102 +101,124 @@ def init_db():
     conn.close()
 
 
-def save_mapping(source_chat, source_id, target_chat, target_id):
+def save_mapping(
+    source_chat,
+    source_topic,
+    source_msg_id,
+    target_chat,
+    target_topic,
+    target_msg_id
+):
+
     conn = sqlite3.connect(DB_FILE)
 
     conn.execute("""
         INSERT OR REPLACE INTO mappings
         (
             source_chat,
+            source_topic,
             source_msg_id,
+
             target_chat,
+            target_topic,
             target_msg_id
         )
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
     """, (
         str(source_chat),
-        int(source_id),
+        int(source_topic or 0),
+        int(source_msg_id),
+
         str(target_chat),
-        int(target_id),
+        int(target_topic or 0),
+        int(target_msg_id),
     ))
 
     conn.commit()
     conn.close()
 
 
-def get_mapping(source_chat, source_id):
+def get_mapping(
+    source_chat,
+    source_topic,
+    source_msg_id
+):
+
     conn = sqlite3.connect(DB_FILE)
 
     row = conn.execute("""
-        SELECT target_msg_id
+        SELECT
+            target_chat,
+            target_topic,
+            target_msg_id
         FROM mappings
         WHERE source_chat = ?
+        AND source_topic = ?
         AND source_msg_id = ?
     """, (
         str(source_chat),
-        int(source_id),
+        int(source_topic or 0),
+        int(source_msg_id),
     )).fetchone()
 
     conn.close()
 
-    return row[0] if row else None
+    return row
 
 
 # =========================================================
-# TEXT / LINK PROCESSING
+# PYROGRAM SOURCE CLIENT
 # =========================================================
 
-def process_text(text, config, source_chat):
+source_client = Client(
+    PYROGRAM_SESSION,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
+
+
+# =========================================================
+# SOURCE CHAT NORMALIZATION
+# =========================================================
+
+def normalize_chat(value):
+
+    value = str(value).strip()
+
+    if value.startswith("https://t.me/"):
+        value = value.rstrip("/")
+
+        parts = value.split("/")
+
+        if len(parts) >= 4:
+
+            # https://t.me/username
+            value = parts[3]
+
+    value = value.replace("@", "")
+
+    if value.lstrip("-").isdigit():
+        return int(value)
+
+    return value
+
+
+# =========================================================
+# TEXT PROCESSING
+# =========================================================
+
+def replace_plain_text(text, config):
+
     if not text:
         return ""
 
-    # Text replacement
     if config["replace_from"]:
         text = text.replace(
             config["replace_from"],
             config["replace_to"]
         )
 
-    # Internal Telegram message links
-    old_chat = config["old_chat"]
-    new_chat = config["new_chat"]
-
-    if old_chat and new_chat:
-
-        pattern = re.compile(
-            r"https?://t\.me/"
-            r"(c/\d+|[A-Za-z0-9_]+)/"
-            r"(\d+)"
-        )
-
-        def replace_link(match):
-
-            chat_part = match.group(1)
-            message_id = int(match.group(2))
-
-            if chat_part != old_chat:
-                return match.group(0)
-
-            mapped_id = get_mapping(
-                source_chat,
-                message_id
-            )
-
-            if mapped_id is None:
-                return match.group(0)
-
-            return (
-                f"https://t.me/"
-                f"{new_chat}/"
-                f"{mapped_id}"
-            )
-
-        text = pattern.sub(
-            replace_link,
-            text
-        )
-
-    # Prefix / suffix
     return (
         config["prefix"]
         + text
@@ -175,44 +227,726 @@ def process_text(text, config, source_chat):
 
 
 # =========================================================
-# START
+# TELEGRAM LINK PROCESSING
 # =========================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+TELEGRAM_LINK_PATTERN = re.compile(
+    r"https?://t\.me/"
+    r"(c/\d+|[A-Za-z0-9_]+)"
+    r"(?:/(\d+))?"
+    r"(?:/(\d+))?"
+)
+
+
+def rewrite_telegram_url(
+    url,
+    source_chat,
+    config
+):
+
+    if not url:
+        return url
+
+    match = TELEGRAM_LINK_PATTERN.fullmatch(
+        url
+    )
+
+    if not match:
+        return url
+
+    chat_part = match.group(1)
+
+    first_id = match.group(2)
+    second_id = match.group(3)
+
+    if not first_id:
+        return url
+
+    message_id = int(
+        second_id or first_id
+    )
+
+    mapped = get_mapping(
+        source_chat,
+        0,
+        message_id
+    )
+
+    if not mapped:
+        return url
+
+    target_chat, target_topic, target_msg = mapped
+
+    # Public username target.
+    target_chat_clean = str(
+        target_chat
+    ).replace("-100", "")
+
+    # For public target chats.
+    if str(target_chat).lstrip("-").isdigit():
+        return (
+            f"https://t.me/c/"
+            f"{target_chat_clean}/"
+            f"{target_msg}"
+        )
+
+    return (
+        f"https://t.me/"
+        f"{target_chat_clean}/"
+        f"{target_msg}"
+    )
+
+
+# =========================================================
+# ENTITY HELPERS
+# =========================================================
+
+def get_message_text(message):
+
+    if message.text:
+        return message.text
+
+    if message.caption:
+        return message.caption
+
+    return ""
+
+
+def get_entities(message):
+
+    if message.entities:
+        return message.entities
+
+    if message.caption_entities:
+        return message.caption_entities
+
+    return []
+
+
+# =========================================================
+# ENTITY-AWARE TEXT PROCESSING
+# =========================================================
+
+def process_message_text(
+    message,
+    config,
+    source_chat
+):
+
+    text = get_message_text(message)
+
+    if not text:
+        return "", []
+
+    entities = get_entities(message)
+
+    # -----------------------------------------------------
+    # First pass: replace hyperlinks inside entities
+    # -----------------------------------------------------
+
+    rewritten_urls = {}
+
+    for entity in entities:
+
+        if entity.type in (
+            MessageEntityType.TEXT_LINK,
+            MessageEntityType.URL,
+        ):
+
+            try:
+
+                if entity.type == MessageEntityType.TEXT_LINK:
+
+                    old_url = entity.url
+
+                    new_url = rewrite_telegram_url(
+                        old_url,
+                        source_chat,
+                        config
+                    )
+
+                    rewritten_urls[
+                        id(entity)
+                    ] = new_url
+
+            except Exception:
+                pass
+
+    # -----------------------------------------------------
+    # Plain text processing
+    # -----------------------------------------------------
+
+    processed = replace_plain_text(
+        text,
+        config
+    )
+
+    return processed, entities
+
+
+# =========================================================
+# CAPTION PROCESSING
+# =========================================================
+
+def process_caption(
+    caption,
+    config
+):
+
+    if not caption:
+        return None
+
+    mode = config["caption_mode"]
+
+    if mode == "remove":
+        return None
+
+    if mode == "replace":
+
+        caption = caption.replace(
+            config["caption_replace_from"],
+            config["caption_replace_to"]
+        )
+
+    caption = (
+        config["prefix"]
+        + caption
+        + config["suffix"]
+    )
+
+    return caption
+
+
+# =========================================================
+# SEND TEXT MESSAGE
+# =========================================================
+
+async def send_text_message(
+    message,
+    target_chat,
+    target_topic,
+    config
+):
+
+    text = message.text
+
+    if not text:
+        return None
+
+    processed = replace_plain_text(
+        text,
+        config
+    )
+
+    kwargs = {}
+
+    if target_topic:
+        kwargs["message_thread_id"] = target_topic
+
+    # Telegram Bot API will preserve entities
+    # when supplied explicitly.
+
+    if message.entities:
+
+        kwargs["entities"] = [
+            entity_to_bot_entity(e)
+            for e in message.entities
+        ]
+
+    return await target_bot.send_message(
+        chat_id=target_chat,
+        text=processed,
+        **kwargs
+    )
+
+
+# =========================================================
+# PYROGRAM ENTITY → BOT API ENTITY
+# =========================================================
+
+from telegram import MessageEntity as BotMessageEntity
+
+
+def entity_to_bot_entity(entity):
+
+    entity_type = entity.type
+
+    mapping = {
+
+        MessageEntityType.MENTION:
+            "mention",
+
+        MessageEntityType.HASHTAG:
+            "hashtag",
+
+        MessageEntityType.CASHTAG:
+            "cashtag",
+
+        MessageEntityType.BOT_COMMAND:
+            "bot_command",
+
+        MessageEntityType.URL:
+            "url",
+
+        MessageEntityType.EMAIL:
+            "email",
+
+        MessageEntityType.PHONE_NUMBER:
+            "phone_number",
+
+        MessageEntityType.BOLD:
+            "bold",
+
+        MessageEntityType.ITALIC:
+            "italic",
+
+        MessageEntityType.UNDERLINE:
+            "underline",
+
+        MessageEntityType.STRIKETHROUGH:
+            "strikethrough",
+
+        MessageEntityType.SPOILER:
+            "spoiler",
+
+        MessageEntityType.CODE:
+            "code",
+
+        MessageEntityType.PRE:
+            "pre",
+
+        MessageEntityType.TEXT_LINK:
+            "text_link",
+
+        MessageEntityType.CUSTOM_EMOJI:
+            "custom_emoji",
+    }
+
+    kwargs = {
+        "type": mapping.get(
+            entity_type,
+            "text_mention"
+        ),
+        "offset": entity.offset,
+        "length": entity.length,
+    }
+
+    if entity.type == MessageEntityType.TEXT_LINK:
+
+        kwargs["url"] = entity.url
+
+    if entity.type == MessageEntityType.TEXT_MENTION:
+
+        kwargs["user"] = entity.user.id
+
+    if entity.type == MessageEntityType.PRE:
+
+        kwargs["language"] = entity.language
+
+    if entity.type == MessageEntityType.CUSTOM_EMOJI:
+
+        kwargs["custom_emoji_id"] = (
+            entity.custom_emoji_id
+        )
+
+    return BotMessageEntity(
+        **kwargs
+    )
+
+
+# =========================================================
+# MEDIA SENDING
+# =========================================================
+
+async def send_media_message(
+    message,
+    target_chat,
+    target_topic,
+    config
+):
+
+    caption = process_caption(
+        message.caption,
+        config
+    )
+
+    kwargs = {}
+
+    if target_topic:
+        kwargs["message_thread_id"] = target_topic
+
+    if caption:
+        kwargs["caption"] = caption
+
+    # -----------------------------------------------------
+    # PHOTO
+    # -----------------------------------------------------
+
+    if message.photo:
+
+        return await target_bot.send_photo(
+            chat_id=target_chat,
+            photo=message.photo.file_id,
+            **kwargs
+        )
+
+    # -----------------------------------------------------
+    # VIDEO
+    # -----------------------------------------------------
+
+    if message.video:
+
+        return await target_bot.send_video(
+            chat_id=target_chat,
+            video=message.video.file_id,
+            **kwargs
+        )
+
+    # -----------------------------------------------------
+    # DOCUMENT
+    # -----------------------------------------------------
+
+    if message.document:
+
+        return await target_bot.send_document(
+            chat_id=target_chat,
+            document=message.document.file_id,
+            **kwargs
+        )
+
+    # -----------------------------------------------------
+    # AUDIO
+    # -----------------------------------------------------
+
+    if message.audio:
+
+        return await target_bot.send_audio(
+            chat_id=target_chat,
+            audio=message.audio.file_id,
+            **kwargs
+        )
+
+    # -----------------------------------------------------
+    # VOICE
+    # -----------------------------------------------------
+
+    if message.voice:
+
+        return await target_bot.send_voice(
+            chat_id=target_chat,
+            voice=message.voice.file_id,
+            **kwargs
+        )
+
+    # -----------------------------------------------------
+    # ANIMATION
+    # -----------------------------------------------------
+
+    if message.animation:
+
+        return await target_bot.send_animation(
+            chat_id=target_chat,
+            animation=message.animation.file_id,
+            **kwargs
+        )
+
+    return None
+
+
+# =========================================================
+# CLONE
+# =========================================================
+
+async def clone_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not update.effective_message:
         return
 
-    print(
-        f"START RECEIVED: "
-        f"{update.effective_user.id}",
-        flush=True
+    args = context.args
+
+    if len(args) < 4:
+
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "/clone Source Target From_ID To_ID "
+            "[Src_Topic_ID] [Tgt_Topic_ID]"
+        )
+
+        return
+
+    source = normalize_chat(args[0])
+    target = normalize_chat(args[1])
+
+    try:
+
+        from_id = int(args[2])
+        to_id = int(args[3])
+
+        src_topic = (
+            int(args[4])
+            if len(args) > 4
+            else 0
+        )
+
+        tgt_topic = (
+            int(args[5])
+            if len(args) > 5
+            else 0
+        )
+
+    except ValueError:
+
+        await update.effective_message.reply_text(
+            "❌ IDs must be numbers."
+        )
+
+        return
+
+    config = get_config(
+        update.effective_user.id
     )
 
-    await update.effective_message.reply_text(
-        "🚀 Advanced Bulk Content Manager Bot Active!\n\n"
+    total = max(
+        0,
+        to_id - from_id + 1
+    )
 
-        "Configuration:\n"
+    status = await update.effective_message.reply_text(
+        "🚀 Transfer started..."
+    )
+
+    success = 0
+    failed = 0
+
+    # -----------------------------------------------------
+    # SOURCE HISTORY
+    # -----------------------------------------------------
+
+    try:
+
+        messages = []
+
+        async for message in source_client.get_chat_history(
+            source
+        ):
+
+            if message.id < from_id:
+                break
+
+            if message.id > to_id:
+                continue
+
+            # Topic filtering.
+            if src_topic:
+
+                message_topic = (
+                    message.message_thread_id
+                    or 0
+                )
+
+                if message_topic != src_topic:
+                    continue
+
+            messages.append(message)
+
+        messages.reverse()
+
+    except Exception as e:
+
+        await status.edit_text(
+            f"❌ Could not read source chat:\n{e}"
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # TRANSFER
+    # -----------------------------------------------------
+
+    for index, message in enumerate(
+        messages,
+        start=1
+    ):
+
+        try:
+
+            result = None
+
+            # Text
+            if message.text:
+
+                result = await send_text_message(
+                    message,
+                    target,
+                    tgt_topic,
+                    config
+                )
+
+            # Media
+            else:
+
+                result = await send_media_message(
+                    message,
+                    target,
+                    tgt_topic,
+                    config
+                )
+
+            if result:
+
+                save_mapping(
+                    source,
+                    src_topic,
+                    message.id,
+
+                    target,
+                    tgt_topic,
+                    result.message_id
+                )
+
+                success += 1
+
+            else:
+
+                failed += 1
+
+        except FloodWait as e:
+
+            await asyncio.sleep(
+                e.value + 1
+            )
+
+            try:
+
+                # Retry same message.
+                if message.text:
+
+                    result = await send_text_message(
+                        message,
+                        target,
+                        tgt_topic,
+                        config
+                    )
+
+                else:
+
+                    result = await send_media_message(
+                        message,
+                        target,
+                        tgt_topic,
+                        config
+                    )
+
+                if result:
+
+                    save_mapping(
+                        source,
+                        src_topic,
+                        message.id,
+
+                        target,
+                        tgt_topic,
+                        result.message_id
+                    )
+
+                    success += 1
+
+            except Exception as retry_error:
+
+                failed += 1
+
+                print(
+                    f"Retry failed "
+                    f"{message.id}: "
+                    f"{retry_error}",
+                    flush=True
+                )
+
+        except Exception as e:
+
+            failed += 1
+
+            print(
+                f"Transfer error "
+                f"{message.id}: {e}",
+                flush=True
+            )
+
+        # -------------------------------------------------
+        # PROGRESS
+        # -------------------------------------------------
+
+        if (
+            index == 1
+            or index % 5 == 0
+            or index == len(messages)
+        ):
+
+            percentage = (
+                index / len(messages) * 100
+                if messages
+                else 100
+            )
+
+            try:
+
+                await status.edit_text(
+                    "⏳ Bulk Transfer\n\n"
+                    f"Processed: `{index}/{len(messages)}`\n"
+                    f"Success: `{success}`\n"
+                    f"Failed: `{failed}`\n"
+                    f"Progress: `{percentage:.1f}%`"
+                )
+
+            except TelegramError:
+                pass
+
+        await asyncio.sleep(
+            0.3
+        )
+
+    # -----------------------------------------------------
+    # COMPLETE
+    # -----------------------------------------------------
+
+    try:
+
+        await status.edit_text(
+            "🏁 Bulk Transfer Completed\n\n"
+            f"✅ Success: `{success}`\n"
+            f"❌ Failed: `{failed}`\n"
+            f"📦 Total: `{len(messages)}`"
+        )
+
+    except TelegramError:
+        pass
+
+
+# =========================================================
+# BASIC COMMANDS
+# =========================================================
+
+async def start_command(update, context):
+
+    await update.effective_message.reply_text(
+        "🚀 Bulk Transfer Bot\n\n"
+
+        "/clone Source Target From_ID To_ID "
+        "[Src_Topic_ID] [Tgt_Topic_ID]\n\n"
+
         "/setprefix text\n"
         "/setsuffix text\n"
         "/setreplace old | new\n"
-        "/setlink old_chat | new_chat\n"
+        "/setlink old | new\n"
         "/status\n"
-        "/reset\n\n"
-
-        "Bulk Transfer:\n"
-        "/clone Source Target From_ID To_ID Src_Topic_ID Tgt_Topic_ID"
+        "/reset"
     )
 
 
-# =========================================================
-# PREFIX
-# =========================================================
-
 async def set_prefix(update, context):
-
-    if not update.effective_message:
-        return
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -233,14 +967,7 @@ async def set_prefix(update, context):
     )
 
 
-# =========================================================
-# SUFFIX
-# =========================================================
-
 async def set_suffix(update, context):
-
-    if not update.effective_message:
-        return
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -261,14 +988,7 @@ async def set_suffix(update, context):
     )
 
 
-# =========================================================
-# REPLACE
-# =========================================================
-
 async def set_replace(update, context):
-
-    if not update.effective_message:
-        return
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -299,22 +1019,15 @@ async def set_replace(update, context):
     config["replace_to"] = new.strip()
 
     await update.effective_message.reply_text(
-        "✅ Text replacement configured."
+        "✅ Replacement configured."
     )
 
 
-# =========================================================
-# LINK
-# =========================================================
-
 async def set_link(update, context):
-
-    if not update.effective_message:
-        return
 
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage:\n/setlink old_chat | new_chat"
+            "Usage:\n/setlink old | new"
         )
         return
 
@@ -324,7 +1037,7 @@ async def set_link(update, context):
 
     if " | " not in value:
         await update.effective_message.reply_text(
-            "Usage:\n/setlink old_chat | new_chat"
+            "Usage:\n/setlink old | new"
         )
         return
 
@@ -337,29 +1050,29 @@ async def set_link(update, context):
         update.effective_user.id
     )
 
-    config["old_chat"] = old.strip().replace("@", "")
-    config["new_chat"] = new.strip().replace("@", "")
+    config["old_chat"] = old.strip().replace(
+        "@",
+        ""
+    )
+
+    config["new_chat"] = new.strip().replace(
+        "@",
+        ""
+    )
 
     await update.effective_message.reply_text(
-        "✅ Internal Telegram link mapping configured."
+        "✅ Link mapping configured."
     )
 
 
-# =========================================================
-# STATUS
-# =========================================================
-
 async def status_command(update, context):
-
-    if not update.effective_message:
-        return
 
     config = get_config(
         update.effective_user.id
     )
 
     await update.effective_message.reply_text(
-        "📊 Current Settings\n\n"
+        "📊 Settings\n\n"
         f"Prefix: {config['prefix'] or 'None'}\n"
         f"Suffix: {config['suffix'] or 'None'}\n"
         f"Replace: "
@@ -370,14 +1083,7 @@ async def status_command(update, context):
     )
 
 
-# =========================================================
-# RESET
-# =========================================================
-
 async def reset_command(update, context):
-
-    if not update.effective_message:
-        return
 
     USER_CONFIGS[
         update.effective_user.id
@@ -389,190 +1095,7 @@ async def reset_command(update, context):
 
 
 # =========================================================
-# CLONE
-# =========================================================
-
-async def clone_command(update, context):
-
-    if not update.effective_message:
-        return
-
-    args = context.args
-
-    if len(args) < 4:
-        await update.effective_message.reply_text(
-            "Usage:\n"
-            "/clone "
-            "Source Target From_ID To_ID "
-            "Src_Topic_ID Tgt_Topic_ID"
-        )
-        return
-
-    source = args[0]
-    target = args[1]
-
-    try:
-        from_id = int(args[2])
-        to_id = int(args[3])
-
-        src_topic = (
-            int(args[4])
-            if len(args) > 4
-            else 0
-        )
-
-        tgt_topic = (
-            int(args[5])
-            if len(args) > 5
-            else 0
-        )
-
-    except ValueError:
-        await update.effective_message.reply_text(
-            "❌ IDs must be numbers."
-        )
-        return
-
-    if source.lstrip("-").isdigit():
-        source = int(source)
-
-    if target.lstrip("-").isdigit():
-        target = int(target)
-
-    config = get_config(
-        update.effective_user.id
-    )
-
-    status = await update.effective_message.reply_text(
-        "🚀 Bulk transfer started..."
-    )
-
-    success = 0
-    failed = 0
-
-    total = max(
-        0,
-        to_id - from_id + 1
-    )
-
-    source_db = str(source).replace(
-        "-100",
-        ""
-    )
-
-    target_db = str(target).replace(
-        "-100",
-        ""
-    )
-
-    for message_id in range(
-        from_id,
-        to_id + 1
-    ):
-
-        try:
-
-            # -------------------------
-            # GET SOURCE MESSAGE
-            # -------------------------
-
-            msg = await context.bot.forward_message(
-                chat_id=target,
-                from_chat_id=source,
-                message_id=message_id,
-                disable_notification=True,
-            )
-
-            # -------------------------
-            # IMPORTANT
-            # -------------------------
-            #
-            # This first version uses Telegram's
-            # native forward operation.
-            #
-            # Advanced text/media rewriting is
-            # handled separately below when possible.
-            #
-
-            if msg:
-
-                save_mapping(
-                    source_db,
-                    message_id,
-                    target_db,
-                    msg.message_id
-                )
-
-                success += 1
-
-            # -------------------------
-            # PROGRESS
-            # -------------------------
-
-            done = (
-                message_id - from_id + 1
-            )
-
-            if done == 1 or done % 5 == 0:
-
-                percentage = (
-                    done / total * 100
-                    if total
-                    else 100
-                )
-
-                try:
-                    await status.edit_text(
-                        "⏳ Bulk Transfer\n\n"
-                        f"Processed: `{done}/{total}`\n"
-                        f"Success: `{success}`\n"
-                        f"Failed: `{failed}`\n"
-                        f"Progress: `{percentage:.1f}%`"
-                    )
-                except TelegramError:
-                    pass
-
-            await asyncio.sleep(1.2)
-
-        except RetryAfter as e:
-
-            await asyncio.sleep(
-                e.retry_after + 1
-            )
-
-        except TelegramError as e:
-
-            failed += 1
-
-            print(
-                f"Telegram error "
-                f"{message_id}: {e}",
-                flush=True
-            )
-
-        except Exception as e:
-
-            failed += 1
-
-            print(
-                f"Clone error "
-                f"{message_id}: {e}",
-                flush=True
-            )
-
-    try:
-        await status.edit_text(
-            "🏁 Bulk Transfer Completed\n\n"
-            f"✅ Success: `{success}`\n"
-            f"❌ Failed: `{failed}`\n"
-            f"📦 Total: `{total}`"
-        )
-    except TelegramError:
-        pass
-
-
-# =========================================================
-# RENDER WEB SERVER
+# WEB SERVER
 # =========================================================
 
 async def home(request):
@@ -585,16 +1108,14 @@ async def home(request):
 
 async def start_web_server():
 
-    web_app = web.Application()
+    app = web.Application()
 
-    web_app.router.add_get(
+    app.router.add_get(
         "/",
         home
     )
 
-    runner = web.AppRunner(
-        web_app
-    )
+    runner = web.AppRunner(app)
 
     await runner.setup()
 
@@ -607,7 +1128,7 @@ async def start_web_server():
     await site.start()
 
     print(
-        f"HTTP server running on 0.0.0.0:{PORT}",
+        f"HTTP server running on port {PORT}",
         flush=True
     )
 
@@ -619,22 +1140,58 @@ async def start_web_server():
 async def setup_commands(application):
 
     await application.bot.set_my_commands([
-        BotCommand("start", "Start the bot"),
-        BotCommand("setprefix", "Add prefix"),
-        BotCommand("setsuffix", "Add suffix"),
-        BotCommand("setreplace", "Replace text"),
-        BotCommand("setlink", "Configure internal links"),
-        BotCommand("status", "Show settings"),
-        BotCommand("reset", "Reset settings"),
-        BotCommand("clone", "Bulk transfer messages"),
+
+        BotCommand(
+            "start",
+            "Start bot"
+        ),
+
+        BotCommand(
+            "setprefix",
+            "Add prefix"
+        ),
+
+        BotCommand(
+            "setsuffix",
+            "Add suffix"
+        ),
+
+        BotCommand(
+            "setreplace",
+            "Replace text"
+        ),
+
+        BotCommand(
+            "setlink",
+            "Configure links"
+        ),
+
+        BotCommand(
+            "status",
+            "Show settings"
+        ),
+
+        BotCommand(
+            "reset",
+            "Reset settings"
+        ),
+
+        BotCommand(
+            "clone",
+            "Bulk transfer"
+        ),
+
     ])
 
 
 # =========================================================
-# ERROR HANDLER
+# ERROR
 # =========================================================
 
-async def error_handler(update, context):
+async def error_handler(
+    update,
+    context
+):
 
     print(
         f"BOT ERROR: {context.error}",
@@ -643,12 +1200,25 @@ async def error_handler(update, context):
 
 
 # =========================================================
+# GLOBAL TARGET BOT
+# =========================================================
+
+target_bot = None
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
 def main():
 
+    global target_bot
+
     init_db()
+
+    # -----------------------------------------------------
+    # Telegram Bot API
+    # -----------------------------------------------------
 
     application = (
         Application.builder()
@@ -657,99 +1227,119 @@ def main():
         .build()
     )
 
-    # Commands
+    target_bot = application.bot
+
+    # -----------------------------------------------------
+    # Pyrogram source bot
+    # -----------------------------------------------------
+
+    async def run():
+
+        await source_client.start()
+
+        me = await source_client.get_me()
+
+        print(
+            f"Pyrogram source client online: "
+            f"@{me.username}",
+            flush=True
+        )
+
+        # Web server
+        await start_web_server()
+
+        # Telegram Bot API polling
+        await application.initialize()
+
+        await application.start()
+
+        await application.updater.start_polling(
+            drop_pending_updates=True
+        )
+
+        print(
+            "Target Bot polling started.",
+            flush=True
+        )
+
+        await asyncio.Event().wait()
+
+    # -----------------------------------------------------
+    # Handlers
+    # -----------------------------------------------------
+
     application.add_handler(
-        CommandHandler("start", start_command)
+        CommandHandler(
+            "start",
+            start_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("setprefix", set_prefix)
+        CommandHandler(
+            "setprefix",
+            set_prefix
+        )
     )
 
     application.add_handler(
-        CommandHandler("setsuffix", set_suffix)
+        CommandHandler(
+            "setsuffix",
+            set_suffix
+        )
     )
 
     application.add_handler(
-        CommandHandler("setreplace", set_replace)
+        CommandHandler(
+            "setreplace",
+            set_replace
+        )
     )
 
     application.add_handler(
-        CommandHandler("setlink", set_link)
+        CommandHandler(
+            "setlink",
+            set_link
+        )
     )
 
     application.add_handler(
-        CommandHandler("status", status_command)
+        CommandHandler(
+            "status",
+            status_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("reset", reset_command)
+        CommandHandler(
+            "reset",
+            reset_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("clone", clone_command)
+        CommandHandler(
+            "clone",
+            clone_command
+        )
     )
 
     application.add_error_handler(
         error_handler
     )
 
-    print(
-        "Starting Bulk Manager Bot...",
-        flush=True
-    )
+    try:
 
-    # Start HTTP server in a background thread/event loop
-    async def web_runner():
+        asyncio.run(run())
 
-        await start_web_server()
-
-        while True:
-            await asyncio.sleep(3600)
-
-    async def run():
-
-        web_task = asyncio.create_task(
-            web_runner()
-        )
+    finally:
 
         try:
-
-            # Remove any old Telegram webhook.
-            await application.bot.delete_webhook(
-                drop_pending_updates=True
+            asyncio.run(
+                source_client.stop()
             )
-
-            print(
-                "Webhook removed. Starting polling...",
-                flush=True
-            )
-
-            await application.initialize()
-            await application.start()
-
-            await application.updater.start_polling(
-                drop_pending_updates=True
-            )
-
-            me = await application.bot.get_me()
-
-            print(
-                f"Bot online: @{me.username}",
-                flush=True
-            )
-
-            await asyncio.Event().wait()
-
-        finally:
-
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
-
-            web_task.cancel()
-
-    asyncio.run(run())
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
