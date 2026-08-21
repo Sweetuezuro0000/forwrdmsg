@@ -2,7 +2,330 @@ import os
 import re
 import copy
 import time
+import sqlite3Twelve Dev, [22.08.2026 01:24]
+import os
+import re
+import copy
+import time
 import sqlite3
+import asyncio
+
+from aiohttp import web
+
+from pyrogram import Client
+from pyrogram.enums import MessageEntityType
+from pyrogram.errors import FloodWait, RPCError
+
+# =========================================================
+# ENVIRONMENT
+# =========================================================
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]   # your account — reads source, sends to target
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]             # all commands (incl. /clone) go through this bot
+OWNER_ID = int(os.environ["OWNER_ID"])          # your numeric Telegram user id — only you can command it
+PORT = int(os.environ.get("PORT", "10000"))
+
+START_TIME = time.time()
+
+
+# =========================================================
+# CONFIG (single owner)
+# =========================================================
+
+def default_config():
+    return {
+        "prefix": "",
+        "suffix": "",
+
+        "replace_from": "",
+        "replace_to": "",
+
+        # caption_mode: keep | remove | replace
+        "caption_mode": "keep",
+        "caption_replace_from": "",
+        "caption_replace_to": "",
+    }
+
+
+CONFIG = default_config()
+
+
+# =========================================================
+# DATABASE (source msg -> target msg mapping, used for link rewrite)
+# =========================================================
+
+DB_FILE = "link_mapping.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mappings (
+            source_chat TEXT NOT NULL,
+            source_topic INTEGER NOT NULL DEFAULT 0,
+            source_msg_id INTEGER NOT NULL,
+
+            target_chat TEXT NOT NULL,
+            target_topic INTEGER NOT NULL DEFAULT 0,
+            target_msg_id INTEGER NOT NULL,
+
+            PRIMARY KEY (source_chat, source_topic, source_msg_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_mapping(source_chat, source_topic, source_msg_id,
+                  target_chat, target_topic, target_msg_id):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT OR REPLACE INTO mappings
+        (source_chat, source_topic, source_msg_id,
+         target_chat, target_topic, target_msg_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        str(source_chat), int(source_topic or 0), int(source_msg_id),
+        str(target_chat), int(target_topic or 0), int(target_msg_id),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_mapping(source_chat, source_topic, source_msg_id):
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("""
+        SELECT target_chat, target_topic, target_msg_id
+        FROM mappings
+        WHERE source_chat = ? AND source_topic = ? AND source_msg_id = ?
+    """, (str(source_chat), int(source_topic or 0), int(source_msg_id))).fetchone()
+    conn.close()
+    return row
+
+
+# =========================================================
+# PYROGRAM CLIENT — YOUR ACCOUNT. Reads source AND sends to target.
+# =========================================================
+
+app = Client(
+    "userbot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+    in_memory=True,
+)
+
+
+# =========================================================
+# CHAT NORMALIZATION
+# =========================================================
+
+def normalize_chat(value):
+    value = str(value).strip()
+
+    if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
+        value = value.rstrip("/")
+        parts = value.split("/")
+        if len(parts) >= 4:
+            value = parts[3]
+
+    value = value.replace("@", "")
+
+    if value.lstrip("-").isdigit():
+        return int(value)
+
+    return value
+
+
+async def ensure_access(chat):
+    try:
+        await app.get_chat(chat)
+        return
+    except Exception as first_err:
+        err = first_err
+
+Twelve Dev, [22.08.2026 01:24]
+if isinstance(chat, str):
+        try:
+            await app.join_chat(chat)
+            return
+        except Exception as e:
+            raise RuntimeError(f"Public chat '{chat}' me join nahi ho paya.\nError: {e}")
+
+    raise RuntimeError(
+        f"Chat ID {chat} access nahi ho raha. Aapka session-account is chat "
+        f"ka member hona chahiye.\nError: {err}"
+    )
+
+
+# =========================================================
+# UTF-16 HELPERS
+# =========================================================
+
+def utf16_len(text):
+    if not text:
+        return 0
+    return len(text.encode("utf-16-le")) // 2
+
+
+# =========================================================
+# TELEGRAM LINK REWRITING
+# =========================================================
+
+TELEGRAM_LINK_PATTERN = re.compile(
+    r"https?://t\.me/"
+    r"(c/\d+|[A-Za-z0-9_]+)"
+    r"(?:/(\d+))?"
+    r"(?:/(\d+))?"
+)
+
+
+def _build_target_link(target_chat, target_topic, target_msg):
+    target_chat_str = str(target_chat)
+
+    if target_chat_str.lstrip("-").isdigit():
+        cid = target_chat_str.replace("-100", "")
+        if target_topic:
+            return f"https://t.me/c/{cid}/{target_topic}/{target_msg}"
+        return f"https://t.me/c/{cid}/{target_msg}"
+
+    if target_topic:
+        return f"https://t.me/{target_chat_str}/{target_topic}/{target_msg}"
+    return f"https://t.me/{target_chat_str}/{target_msg}"
+
+
+def rewrite_telegram_url(url, source_chat, source_topic):
+    if not url:
+        return url
+
+    match = TELEGRAM_LINK_PATTERN.fullmatch(url.strip())
+    if not match:
+        return url
+
+    first_id = match.group(2)
+    second_id = match.group(3)
+    if not first_id:
+        return url
+
+    message_id = int(second_id or first_id)
+
+    mapped = get_mapping(source_chat, source_topic or 0, message_id)
+    if not mapped:
+        return url
+
+    target_chat, target_topic, target_msg = mapped
+    return _build_target_link(target_chat, target_topic, target_msg)
+
+
+def rewrite_plain_urls(text, source_chat, source_topic):
+    if not text:
+        return text
+
+    def _sub(m):
+        return rewrite_telegram_url(m.group(0), source_chat, source_topic)
+
+    return TELEGRAM_LINK_PATTERN.sub(_sub, text)
+
+
+# =========================================================
+# ENTITY HANDLING (Pyrogram objects reused directly — same client sends)
+# =========================================================
+
+def clone_entity(entity, offset_shift, url_override=None):
+    new_entity = copy.copy(entity)
+    new_entity.offset = entity.offset + offset_shift
+    if url_override is not None and entity.type == MessageEntityType.TEXT_LINK:
+        new_entity.url = url_override
+    return new_entity
+
+
+def build_entities(entities, offset_shift, source_chat, source_topic):
+    result = []
+    for e in entities or []:
+        url_override = None
+        if e.type == MessageEntityType.TEXT_LINK:
+            url_override = rewrite_telegram_url(e.url, source_chat, source_topic)
+        try:
+            result.append(clone_entity(e, offset_shift, url_override))
+        except Exception:
+            continue
+    return result
+
+
+def process_text_or_caption(raw_text, entities, config, source_chat, source_topic,
+                             is_caption=False):
+    raw_text = raw_text or ""
+
+    if is_caption:
+        mode = config["caption_mode"]
+        if mode == "remove":
+            return None, None
+        replace_from = config["caption_replace_from"] if mode == "replace" else ""
+        replace_to = config["caption_replace_to"] if mode == "replace" else ""
+    else:
+        replace_from = config["replace_from"]
+        replace_to = config["replace_to"]
+
+    prefix = config["prefix"]
+    suffix = config["suffix"]
+
+    if replace_from:
+        text = raw_text.replace(replace_from, replace_to)
+        text = rewrite_plain_urls(text, source_chat, source_topic)
+        text = f"{prefix}{text}{suffix}"
+        return (text or None) if is_caption else text, None
+
+Twelve Dev, [22.08.2026 01:24]
+shift = utf16_len(prefix)
+    new_entities = build_entities(entities, shift, source_chat, source_topic)
+    final_text = f"{prefix}{raw_text}{suffix}"
+
+    return (final_text or None), (new_entities or None)
+
+
+# =========================================================
+# RENDER FREE TIER COMPATIBLE WEB SERVER
+# =========================================================
+
+async def web_home(request):
+    return web.Response(text="Bot runs perfectly on Render Free Tier Web Service!")
+
+
+async def start_web_server():
+    server = web.Application()
+    server.add_routes([web.get('/', web_home)])
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"[Web Server] Listening on port {PORT}")
+
+
+# =========================================================
+# MAIN ENTRY POINT
+# =========================================================
+
+async def main():
+    # Database initialization
+    init_db()
+
+    # 1. Start Web Server first to prevent Render's port bind crash
+    await start_web_server()
+
+    # 2. Start Pyrogram Userbot Client
+    print("[Pyrogram] Starting client...")
+    await app.start()
+    print("[Pyrogram] Client started successfully!")
+
+    # 3. Block loop to keep services alive
+    await asyncio.Event().wait()
+
+
+if name == "main":
+    asyncio.run(main())
 import asyncio
 
 from aiohttp import web
