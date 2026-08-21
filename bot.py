@@ -637,10 +637,9 @@ async def clone_command(
             if not message or message.empty:
                 failed += 1
                 continue
-
-            # Topic filtering.
+# Topic filtering (Updated to prevent AttributeError)
             if src_topic:
-                message_topic = message.message_thread_id or 0
+                message_topic = getattr(message, 'message_thread_id', None) or 0
                 if message_topic != src_topic:
                     continue
 
