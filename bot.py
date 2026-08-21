@@ -1,42 +1,36 @@
 import os
 import re
+import copy
+import time
 import sqlite3
 import asyncio
 
 from aiohttp import web
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait, RPCError
 
-from telegram import Update, BotCommand, MessageEntity as BotMessageEntity
-from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
 
 # =========================================================
 # ENVIRONMENT
 # =========================================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]   # your own account — does ALL the work
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]             # used ONLY for /ping and /uptime
 PORT = int(os.environ.get("PORT", "10000"))
 
-# A regular Telegram USER session (see generate_session.py), NOT the bot
-# account. This is what lets the source chat be read automatically —
-# bot accounts cannot see history from before they joined a chat, and
-# generally can't self-join channels at all. The bot account is still
-# used for TARGET sending, where you keep it as admin as before.
-SESSION_STRING = os.environ["SESSION_STRING"]
+START_TIME = time.time()
 
 
 # =========================================================
-# USER CONFIG
+# CONFIG (single owner — this is your own account/session)
 # =========================================================
-
-USER_CONFIGS = {}
-
 
 def default_config():
     return {
@@ -53,10 +47,7 @@ def default_config():
     }
 
 
-def get_config(user_id):
-    if user_id not in USER_CONFIGS:
-        USER_CONFIGS[user_id] = default_config()
-    return USER_CONFIGS[user_id]
+CONFIG = default_config()
 
 
 # =========================================================
@@ -113,18 +104,16 @@ def get_mapping(source_chat, source_topic, source_msg_id):
 
 
 # =========================================================
-# PYROGRAM SOURCE CLIENT (reads source chat — a USER account, not the bot)
+# PYROGRAM CLIENT — YOUR ACCOUNT. Reads source AND sends to target.
 # =========================================================
 
-source_client = Client(
-    "source_reader_user",
+app = Client(
+    "userbot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
     in_memory=True,
 )
-
-target_bot = None  # set in main()
 
 
 # =========================================================
@@ -148,35 +137,31 @@ def normalize_chat(value):
     return value
 
 
-# =========================================================
-# AUTO ACCESS TO SOURCE CHAT
-# (bot only needs to be admin in the TARGET chat; a public
-#  source chat/topic is picked up automatically)
-# =========================================================
-
-async def ensure_source_access(chat):
+async def ensure_access(chat):
+    """Your account just needs to already be a member (owner/admin/regular
+    member — all fine) of `chat`. For public chats it will self-join if
+    needed. Private chats need you to already be a member (which you are,
+    if you own/joined the group)."""
     try:
-        await source_client.get_chat(chat)
+        await app.get_chat(chat)
         return
-    except Exception:
-        pass
+    except Exception as first_err:
+        err = first_err
 
     if isinstance(chat, str):
         try:
-            await source_client.join_chat(chat)
+            await app.join_chat(chat)
             return
         except Exception as e:
             raise RuntimeError(
-                "Source group/channel me apne aap join nahi ho paya.\n"
-                "Ye automatic tabhi hota hai jab source PUBLIC ho "
-                "(username wala link/handle).\n"
-                f"Error: {e}"
+                f"Public chat '{chat}' me join nahi ho paya.\nError: {e}"
             )
 
     raise RuntimeError(
-        "Source private hai (sirf numeric ID diya gaya) — private chat "
-        "me khud join nahi ho sakte, wahan aapke (SESSION_STRING wale) "
-        "account ko manually add karna hoga."
+        f"Chat ID {chat} access nahi ho raha. Aapka session-account is chat "
+        f"ka member hona chahiye (private group/channel ho to bhi member hi "
+        f"chahiye — owner ho to already member hoge, ID sahi check karo).\n"
+        f"Error: {err}"
     )
 
 
@@ -217,8 +202,6 @@ def _build_target_link(target_chat, target_topic, target_msg):
 
 
 def rewrite_telegram_url(url, source_chat, source_topic):
-    """If `url` points to a message we already transferred, rewrite it to
-    point at the corresponding message in the target chat/topic."""
     if not url:
         return url
 
@@ -231,8 +214,6 @@ def rewrite_telegram_url(url, source_chat, source_topic):
     if not first_id:
         return url
 
-    # For .../c/<chat>/<topic>/<msg> links second_id is the real message id.
-    # For .../<chat>/<msg> links first_id is the message id.
     message_id = int(second_id or first_id)
 
     mapped = get_mapping(source_chat, source_topic or 0, message_id)
@@ -254,105 +235,39 @@ def rewrite_plain_urls(text, source_chat, source_topic):
 
 
 # =========================================================
-# PLAIN TEXT PROCESSING (prefix / suffix / replace)
+# ENTITY HANDLING (same Pyrogram objects — no cross-library conversion)
 # =========================================================
 
-def apply_replace(text, from_, to_):
-    if from_:
-        text = text.replace(from_, to_)
-    return text
-
-
-def apply_prefix_suffix(text, prefix, suffix):
-    return f"{prefix}{text}{suffix}"
-
-
-# =========================================================
-# ENTITY CONVERSION (Pyrogram -> python-telegram-bot)
-# =========================================================
-
-_ENTITY_TYPE_MAP = {
-    MessageEntityType.MENTION: "mention",
-    MessageEntityType.HASHTAG: "hashtag",
-    MessageEntityType.CASHTAG: "cashtag",
-    MessageEntityType.BOT_COMMAND: "bot_command",
-    MessageEntityType.URL: "url",
-    MessageEntityType.EMAIL: "email",
-    MessageEntityType.PHONE_NUMBER: "phone_number",
-    MessageEntityType.BOLD: "bold",
-    MessageEntityType.ITALIC: "italic",
-    MessageEntityType.UNDERLINE: "underline",
-    MessageEntityType.STRIKETHROUGH: "strikethrough",
-    MessageEntityType.SPOILER: "spoiler",
-    MessageEntityType.CODE: "code",
-    MessageEntityType.PRE: "pre",
-    MessageEntityType.TEXT_LINK: "text_link",
-    MessageEntityType.TEXT_MENTION: "text_mention",
-    MessageEntityType.CUSTOM_EMOJI: "custom_emoji",
-}
-
-if hasattr(MessageEntityType, "BLOCKQUOTE"):
-    _ENTITY_TYPE_MAP[MessageEntityType.BLOCKQUOTE] = "blockquote"
-
-
-def entity_to_bot_entity(entity, offset_shift=0, url_override=None):
-    bot_type = _ENTITY_TYPE_MAP.get(entity.type)
-    if bot_type is None:
-        return None  # unsupported / service entity types are skipped
-
-    kwargs = {
-        "type": bot_type,
-        "offset": entity.offset + offset_shift,
-        "length": entity.length,
-    }
-
-    if entity.type == MessageEntityType.TEXT_LINK:
-        kwargs["url"] = url_override if url_override is not None else entity.url
-
-    if entity.type == MessageEntityType.TEXT_MENTION and entity.user:
-        kwargs["user"] = entity.user
-
-    if entity.type == MessageEntityType.PRE and entity.language:
-        kwargs["language"] = entity.language
-
-    if entity.type == MessageEntityType.CUSTOM_EMOJI:
-        kwargs["custom_emoji_id"] = entity.custom_emoji_id
-
-    return BotMessageEntity(**kwargs)
+def clone_entity(entity, offset_shift, url_override=None):
+    new_entity = copy.copy(entity)
+    new_entity.offset = entity.offset + offset_shift
+    if url_override is not None and entity.type == MessageEntityType.TEXT_LINK:
+        new_entity.url = url_override
+    return new_entity
 
 
 def build_entities(entities, offset_shift, source_chat, source_topic):
-    """Convert Pyrogram entities to Bot API entities, shifting offsets for
-    any prepended prefix and rewriting internal Telegram links."""
     result = []
     for e in entities or []:
         url_override = None
         if e.type == MessageEntityType.TEXT_LINK:
             url_override = rewrite_telegram_url(e.url, source_chat, source_topic)
-
         try:
-            be = entity_to_bot_entity(e, offset_shift=offset_shift, url_override=url_override)
+            result.append(clone_entity(e, offset_shift, url_override))
         except Exception:
-            be = None
-
-        if be is not None:
-            result.append(be)
-
+            continue
     return result
 
 
 def process_text_or_caption(raw_text, entities, config, source_chat, source_topic,
                              is_caption=False):
     """
-    Returns (final_text, bot_entities_or_None).
+    Returns (final_text, entities_or_None).
 
-    - If a plain text-replace is configured (global for text, or caption-specific
-      for captions), we cannot safely keep the original entity offsets after an
-      arbitrary find/replace, so formatting is dropped for that message and it
-      is sent as plain text (prefix/suffix + link rewriting still apply).
-    - Otherwise, formatting/entities are fully preserved, offsets are shifted
-      for the prefix, and any t.me links pointing at already-transferred
-      messages are rewritten to the target chat/topic.
+    If a text-replace is configured, formatting can't be reliably preserved
+    through an arbitrary find/replace, so that message is sent as plain text
+    (prefix/suffix + link rewriting still apply). Otherwise entities are
+    fully preserved and offsets are shifted for the prefix.
     """
     raw_text = raw_text or ""
 
@@ -370,46 +285,41 @@ def process_text_or_caption(raw_text, entities, config, source_chat, source_topi
     suffix = config["suffix"]
 
     if replace_from:
-        # Formatting can't be reliably preserved through an arbitrary
-        # substring replace, so fall back to plain text.
-        text = apply_replace(raw_text, replace_from, replace_to)
+        text = raw_text.replace(replace_from, replace_to)
         text = rewrite_plain_urls(text, source_chat, source_topic)
-        text = apply_prefix_suffix(text, prefix, suffix)
+        text = f"{prefix}{text}{suffix}"
         return (text or None) if is_caption else text, None
 
     shift = utf16_len(prefix)
-    bot_entities = build_entities(entities, shift, source_chat, source_topic)
-    final_text = apply_prefix_suffix(raw_text, prefix, suffix)
+    new_entities = build_entities(entities, shift, source_chat, source_topic)
+    final_text = f"{prefix}{raw_text}{suffix}"
 
     if is_caption:
-        return (final_text or None), (bot_entities or None)
-    return final_text, (bot_entities or None)
+        return (final_text or None), (new_entities or None)
+    return final_text, (new_entities or None)
 
 
 # =========================================================
-# SENDING
+# SENDING (same client that read the message — file_ids stay valid)
 # =========================================================
 
 async def send_text_message(message, target_chat, target_topic, config,
                              source_chat, source_topic):
-    text = message.text
-    if not text:
+    if not message.text:
         return None
 
     final_text, entities = process_text_or_caption(
-        text, message.entities, config, source_chat, source_topic, is_caption=False
+        message.text, message.entities, config, source_chat, source_topic, is_caption=False
     )
-
     if not final_text:
         return None
 
-    kwargs = {}
-    if target_topic:
-        kwargs["message_thread_id"] = target_topic
-    if entities:
-        kwargs["entities"] = entities
-
-    return await target_bot.send_message(chat_id=target_chat, text=final_text, **kwargs)
+    return await app.send_message(
+        chat_id=target_chat,
+        text=final_text,
+        entities=entities,
+        message_thread_id=target_topic or None,
+    )
 
 
 async def send_media_message(message, target_chat, target_topic, config,
@@ -419,35 +329,35 @@ async def send_media_message(message, target_chat, target_topic, config,
         source_chat, source_topic, is_caption=True,
     )
 
-    kwargs = {}
-    if target_topic:
-        kwargs["message_thread_id"] = target_topic
-    if caption_text:
-        kwargs["caption"] = caption_text
-    if caption_entities:
-        kwargs["caption_entities"] = caption_entities
+    kwargs = {
+        "message_thread_id": target_topic or None,
+        "caption": caption_text,
+        "caption_entities": caption_entities,
+    }
 
     if message.photo:
-        return await target_bot.send_photo(chat_id=target_chat, photo=message.photo.file_id, **kwargs)
+        return await app.send_photo(target_chat, photo=message.photo.file_id, **kwargs)
 
     if message.video:
-        return await target_bot.send_video(chat_id=target_chat, video=message.video.file_id, **kwargs)
+        return await app.send_video(target_chat, video=message.video.file_id, **kwargs)
 
     if message.document:
-        return await target_bot.send_document(chat_id=target_chat, document=message.document.file_id, **kwargs)
+        return await app.send_document(target_chat, document=message.document.file_id, **kwargs)
 
     if message.audio:
-        return await target_bot.send_audio(chat_id=target_chat, audio=message.audio.file_id, **kwargs)
+        return await app.send_audio(target_chat, audio=message.audio.file_id, **kwargs)
 
     if message.voice:
-        return await target_bot.send_voice(chat_id=target_chat, voice=message.voice.file_id, **kwargs)
+        return await app.send_voice(target_chat, voice=message.voice.file_id, **kwargs)
 
     if message.animation:
-        return await target_bot.send_animation(chat_id=target_chat, animation=message.animation.file_id, **kwargs)
+        return await app.send_animation(target_chat, animation=message.animation.file_id, **kwargs)
 
     if message.sticker:
-        return await target_bot.send_sticker(chat_id=target_chat, sticker=message.sticker.file_id,
-                                              message_thread_id=target_topic or None)
+        return await app.send_sticker(
+            target_chat, sticker=message.sticker.file_id,
+            message_thread_id=target_topic or None,
+        )
 
     return None
 
@@ -461,37 +371,28 @@ async def send_one(message, target_chat, target_topic, config, source_chat, sour
 
 
 # =========================================================
-# FETCH SOURCE HISTORY (fixed topic filtering)
+# FETCH SOURCE HISTORY (topic filtering done client-side — works everywhere)
 # =========================================================
 
 def _message_topic_id(message):
-    """Best-effort topic id for a message, across pyrogram fork differences."""
     for attr in ("message_thread_id", "reply_to_top_message_id"):
         tid = getattr(message, attr, None)
         if tid:
             return tid
-
-    # Fallback: a message that is a direct reply to the topic's own root
-    # message belongs to that topic even if neither field above is set.
     reply_to = getattr(message, "reply_to_message_id", None)
     if reply_to:
         return reply_to
-
     return None
 
 
 async def fetch_source_messages(source, src_topic, from_id, to_id):
-    await ensure_source_access(source)
+    await ensure_access(source)
 
     messages = []
     seen_topic_ids = set()
 
     try:
-        # We deliberately always walk full chat history and filter by topic
-        # client-side (rather than relying on server-side thread filters),
-        # since that parameter's name/behavior is inconsistent across
-        # pyrogram forks and silently returned nothing on some setups.
-        async for message in source_client.get_chat_history(source):
+        async for message in app.get_chat_history(source):
             if message.id < from_id:
                 break
             if message.id > to_id:
@@ -514,29 +415,67 @@ async def fetch_source_messages(source, src_topic, from_id, to_id):
     if src_topic and not messages and seen_topic_ids:
         raise RuntimeError(
             f"Topic ID {src_topic} ka koi message range me nahi mila. "
-            f"Is range me ye topic IDs mile: {sorted(seen_topic_ids)}. "
-            "Sahi Src_Topic_ID check karo (topic ke pehle message ka link kholo, "
-            "URL me .../<chat>/<topic_id>/<msg_id> hota hai)."
+            f"Is range me ye topic IDs mile: {sorted(seen_topic_ids)}."
         )
 
     return messages
 
 
 # =========================================================
-# /clone COMMAND
+# CONTROL COMMANDS — sent from YOUR OWN account (e.g. Saved Messages).
+# Only messages sent BY you (filters.me) are accepted, so no one else
+# can control the userbot.
 # =========================================================
 
-async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message:
-        return
+CMD_FILTER = filters.me & filters.command(
+    ["clone", "setprefix", "setsuffix", "setreplace",
+     "captionmode", "setcaptionreplace", "status", "reset", "help"],
+    prefixes=["/", "."],
+)
 
-    args = context.args
 
+@app.on_message(CMD_FILTER)
+async def control_router(client, message):
+    cmd = message.command[0].lower()
+    args = message.command[1:]
+
+    handlers = {
+        "clone": cmd_clone,
+        "setprefix": cmd_set_prefix,
+        "setsuffix": cmd_set_suffix,
+        "setreplace": cmd_set_replace,
+        "captionmode": cmd_caption_mode,
+        "setcaptionreplace": cmd_set_caption_replace,
+        "status": cmd_status,
+        "reset": cmd_reset,
+        "help": cmd_help,
+    }
+
+    await handlers[cmd](message, args)
+
+
+async def cmd_help(message, args):
+    await message.reply_text(
+        "🚀 Userbot Transfer Control\n\n"
+        "/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]\n\n"
+        "/setprefix text          (- to clear)\n"
+        "/setsuffix text          (- to clear)\n"
+        "/setreplace old | new    (message text; - to clear)\n"
+        "/captionmode keep|remove|replace\n"
+        "/setcaptionreplace old | new\n"
+        "/status\n"
+        "/reset\n\n"
+        "Aapka apna account (session) hi source padhta hai aur target me "
+        "bhejta hai — bas dono chats ka member hona chahiye. Ye commands "
+        "sirf aapke apne account se accept hote hain."
+    )
+
+
+async def cmd_clone(message, args):
     if len(args) < 4:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Usage:\n"
-            "/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]\n\n"
-            "Src_Topic_ID = 0 ya khali chodo agar General/non-topic group hai."
+            "/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]"
         )
         return
 
@@ -549,12 +488,10 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         src_topic = int(args[4]) if len(args) > 4 else 0
         tgt_topic = int(args[5]) if len(args) > 5 else 0
     except ValueError:
-        await update.effective_message.reply_text("❌ IDs must be numbers.")
+        await message.reply_text("❌ IDs must be numbers.")
         return
 
-    config = get_config(update.effective_user.id)
-
-    status = await update.effective_message.reply_text("🔎 Source read kar raha hoon...")
+    status = await message.reply_text("🔎 Source read kar raha hoon...")
 
     try:
         messages = await fetch_source_messages(source, src_topic, from_id, to_id)
@@ -565,20 +502,25 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not messages:
         await status.edit_text(
             "⚠️ Is range/topic me koi message nahi mila.\n"
-            "Check karo: Src_Topic_ID sahi hai? Bot source me access kar pa raha hai?"
+            "Check karo: Src_Topic_ID sahi hai? Aapka account source ka member hai?"
         )
+        return
+
+    try:
+        await ensure_access(target)
+    except Exception as e:
+        await status.edit_text(f"❌ Target access issue:\n{e}")
         return
 
     success = 0
     failed = 0
     total = len(messages)
 
-    for index, message in enumerate(messages, start=1):
+    for index, message_item in enumerate(messages, start=1):
         try:
-            result = await send_one(message, target, tgt_topic, config, source, src_topic)
-
+            result = await send_one(message_item, target, tgt_topic, CONFIG, source, src_topic)
             if result:
-                save_mapping(source, src_topic, message.id, target, tgt_topic, result.message_id)
+                save_mapping(source, src_topic, message_item.id, target, tgt_topic, result.id)
                 success += 1
             else:
                 failed += 1
@@ -586,19 +528,19 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
             try:
-                result = await send_one(message, target, tgt_topic, config, source, src_topic)
+                result = await send_one(message_item, target, tgt_topic, CONFIG, source, src_topic)
                 if result:
-                    save_mapping(source, src_topic, message.id, target, tgt_topic, result.message_id)
+                    save_mapping(source, src_topic, message_item.id, target, tgt_topic, result.id)
                     success += 1
                 else:
                     failed += 1
             except Exception as retry_error:
                 failed += 1
-                print(f"Retry failed {message.id}: {retry_error}", flush=True)
+                print(f"Retry failed {message_item.id}: {retry_error}", flush=True)
 
         except Exception as e:
             failed += 1
-            print(f"Transfer error {message.id}: {e}", flush=True)
+            print(f"Transfer error {message_item.id}: {e}", flush=True)
 
         if index == 1 or index % 5 == 0 or index == total:
             percentage = index / total * 100
@@ -610,7 +552,7 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Failed: `{failed}`\n"
                     f"Progress: `{percentage:.1f}%`"
                 )
-            except TelegramError:
+            except Exception:
                 pass
 
         await asyncio.sleep(0.3)
@@ -620,142 +562,143 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🏁 Bulk Transfer Completed\n\n"
             f"✅ Success: `{success}`\n"
             f"❌ Failed: `{failed}`\n"
-            f"📦 Total: `{total}`\n\n"
-            "ℹ️ Internal t.me links jo already-transferred messages ko point "
-            "karte hain, wo target group/topic ki id se automatically update ho gaye."
+            f"📦 Total: `{total}`"
         )
-    except TelegramError:
+    except Exception:
         pass
 
 
-# =========================================================
-# BASIC COMMANDS
-# =========================================================
-
-async def start_command(update, context):
-    await update.effective_message.reply_text(
-        "🚀 Bulk Transfer Bot\n\n"
-        "/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]\n\n"
-        "/setprefix text\n"
-        "/setsuffix text\n"
-        "/setreplace old | new        (message text ke liye)\n"
-        "/captionmode keep|remove|replace\n"
-        "/setcaptionreplace old | new  (jab captionmode = replace ho)\n"
-        "/status\n"
-        "/reset\n\n"
-        "Source group/channel/topic PUBLIC hone par apne aap access mil jayega "
-        "(SESSION_STRING wale account se) — sirf TARGET group me is bot ko "
-        "admin banana zaroori hai."
-    )
-
-
-async def set_prefix(update, context):
-    if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setprefix Your text\n(/setprefix - to clear)")
+async def cmd_set_prefix(message, args):
+    if not args:
+        await message.reply_text("Usage:\n/setprefix Your text\n(/setprefix - to clear)")
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
-    get_config(update.effective_user.id)["prefix"] = "" if value.strip() == "-" else value
-    await update.effective_message.reply_text("✅ Prefix updated.")
+    value = message.text.split(maxsplit=1)[1]
+    CONFIG["prefix"] = "" if value.strip() == "-" else value
+    await message.reply_text("✅ Prefix updated.")
 
 
-async def set_suffix(update, context):
-    if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setsuffix Your text\n(/setsuffix - to clear)")
+async def cmd_set_suffix(message, args):
+    if not args:
+        await message.reply_text("Usage:\n/setsuffix Your text\n(/setsuffix - to clear)")
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
-    get_config(update.effective_user.id)["suffix"] = "" if value.strip() == "-" else value
-    await update.effective_message.reply_text("✅ Suffix updated.")
+    value = message.text.split(maxsplit=1)[1]
+    CONFIG["suffix"] = "" if value.strip() == "-" else value
+    await message.reply_text("✅ Suffix updated.")
 
 
-async def set_replace(update, context):
-    if not context.args:
-        await update.effective_message.reply_text(
+async def cmd_set_replace(message, args):
+    if not args:
+        await message.reply_text(
             "Usage:\n/setreplace old | new\n(/setreplace - to clear)\n\n"
-            "⚠️ Text replace on hone par us message ki formatting (bold/link etc) "
-            "preserve nahi hogi, plain text jayega."
+            "⚠️ Text replace on hone par us message ki formatting preserve nahi hoti."
         )
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
+    value = message.text.split(maxsplit=1)[1]
 
     if value.strip() == "-":
-        config = get_config(update.effective_user.id)
-        config["replace_from"] = ""
-        config["replace_to"] = ""
-        await update.effective_message.reply_text("✅ Replacement cleared.")
+        CONFIG["replace_from"] = ""
+        CONFIG["replace_to"] = ""
+        await message.reply_text("✅ Replacement cleared.")
         return
 
     if " | " not in value:
-        await update.effective_message.reply_text("Usage:\n/setreplace old | new")
+        await message.reply_text("Usage:\n/setreplace old | new")
         return
 
     old, new = value.split(" | ", 1)
-    config = get_config(update.effective_user.id)
-    config["replace_from"] = old.strip()
-    config["replace_to"] = new.strip()
-    await update.effective_message.reply_text("✅ Replacement configured.")
+    CONFIG["replace_from"] = old.strip()
+    CONFIG["replace_to"] = new.strip()
+    await message.reply_text("✅ Replacement configured.")
 
 
-async def caption_mode_command(update, context):
-    if not context.args or context.args[0].lower() not in ("keep", "remove", "replace"):
-        await update.effective_message.reply_text(
-            "Usage:\n/captionmode keep\n/captionmode remove\n/captionmode replace"
-        )
+async def cmd_caption_mode(message, args):
+    if not args or args[0].lower() not in ("keep", "remove", "replace"):
+        await message.reply_text("Usage:\n/captionmode keep|remove|replace")
         return
-    config = get_config(update.effective_user.id)
-    config["caption_mode"] = context.args[0].lower()
-    await update.effective_message.reply_text(f"✅ Caption mode set to: {config['caption_mode']}")
+    CONFIG["caption_mode"] = args[0].lower()
+    await message.reply_text(f"✅ Caption mode set to: {CONFIG['caption_mode']}")
 
 
-async def set_caption_replace(update, context):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Usage:\n/setcaptionreplace old | new\n"
-            "(applies only when /captionmode is set to replace)"
-        )
+async def cmd_set_caption_replace(message, args):
+    if not args:
+        await message.reply_text("Usage:\n/setcaptionreplace old | new")
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
+    value = message.text.split(maxsplit=1)[1]
 
     if " | " not in value:
-        await update.effective_message.reply_text("Usage:\n/setcaptionreplace old | new")
+        await message.reply_text("Usage:\n/setcaptionreplace old | new")
         return
 
     old, new = value.split(" | ", 1)
-    config = get_config(update.effective_user.id)
-    config["caption_replace_from"] = old.strip()
-    config["caption_replace_to"] = new.strip()
-    await update.effective_message.reply_text("✅ Caption replacement configured.")
+    CONFIG["caption_replace_from"] = old.strip()
+    CONFIG["caption_replace_to"] = new.strip()
+    await message.reply_text("✅ Caption replacement configured.")
 
 
-async def status_command(update, context):
-    config = get_config(update.effective_user.id)
-    await update.effective_message.reply_text(
+async def cmd_status(message, args):
+    await message.reply_text(
         "📊 Settings\n\n"
-        f"Prefix: {config['prefix'] or 'None'}\n"
-        f"Suffix: {config['suffix'] or 'None'}\n"
-        f"Text Replace: {config['replace_from'] or 'None'} → {config['replace_to'] or 'None'}\n"
-        f"Caption Mode: {config['caption_mode']}\n"
-        f"Caption Replace: {config['caption_replace_from'] or 'None'} → "
-        f"{config['caption_replace_to'] or 'None'}"
+        f"Prefix: {CONFIG['prefix'] or 'None'}\n"
+        f"Suffix: {CONFIG['suffix'] or 'None'}\n"
+        f"Text Replace: {CONFIG['replace_from'] or 'None'} → {CONFIG['replace_to'] or 'None'}\n"
+        f"Caption Mode: {CONFIG['caption_mode']}\n"
+        f"Caption Replace: {CONFIG['caption_replace_from'] or 'None'} → "
+        f"{CONFIG['caption_replace_to'] or 'None'}"
     )
 
 
-async def reset_command(update, context):
-    USER_CONFIGS[update.effective_user.id] = default_config()
-    await update.effective_message.reply_text("🔄 Configuration reset.")
+async def cmd_reset(message, args):
+    global CONFIG
+    CONFIG = default_config()
+    await message.reply_text("🔄 Configuration reset.")
 
 
 # =========================================================
-# WEB SERVER (keeps host platforms like Render happy)
+# STATUS BOT — ONLY /ping and /uptime. Does nothing else.
+# =========================================================
+
+def _format_uptime():
+    delta = int(time.time() - START_TIME)
+    days, rem = divmod(delta, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+async def ping_command(update, context):
+    start = time.perf_counter()
+    msg = await update.effective_message.reply_text("🏓 Pinging...")
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    await msg.edit_text(f"🏓 Pong! `{elapsed_ms:.0f} ms`")
+
+
+async def uptime_command(update, context):
+    await update.effective_message.reply_text(f"⏱ Uptime: {_format_uptime()}")
+
+
+# =========================================================
+# WEB SERVER (health check for hosting platforms)
 # =========================================================
 
 async def home(request):
-    return web.Response(text="Bulk Manager Bot is running.", status=200)
+    return web.Response(
+        text=f"Running.\nUptime: {_format_uptime()}",
+        status=200,
+    )
 
 
 async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", home)
-    runner = web.AppRunner(app)
+    web_app = web.Application()
+    web_app.router.add_get("/", home)
+    runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
@@ -763,61 +706,27 @@ async def start_web_server():
 
 
 # =========================================================
-# BOT COMMAND LIST
-# =========================================================
-
-async def setup_commands(application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Start bot"),
-        BotCommand("setprefix", "Add prefix"),
-        BotCommand("setsuffix", "Add suffix"),
-        BotCommand("setreplace", "Replace text"),
-        BotCommand("captionmode", "keep / remove / replace"),
-        BotCommand("setcaptionreplace", "Caption replace text"),
-        BotCommand("status", "Show settings"),
-        BotCommand("reset", "Reset settings"),
-        BotCommand("clone", "Bulk transfer"),
-    ])
-
-
-async def error_handler(update, context):
-    print(f"BOT ERROR: {context.error}", flush=True)
-
-
-# =========================================================
 # MAIN
 # =========================================================
 
 def main():
-    global target_bot
-
     init_db()
 
-    application = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
-    target_bot = application.bot
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("setprefix", set_prefix))
-    application.add_handler(CommandHandler("setsuffix", set_suffix))
-    application.add_handler(CommandHandler("setreplace", set_replace))
-    application.add_handler(CommandHandler("captionmode", caption_mode_command))
-    application.add_handler(CommandHandler("setcaptionreplace", set_caption_replace))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("reset", reset_command))
-    application.add_handler(CommandHandler("clone", clone_command))
-    application.add_error_handler(error_handler)
+    ptb_app = Application.builder().token(BOT_TOKEN).build()
+    ptb_app.add_handler(CommandHandler("ping", ping_command))
+    ptb_app.add_handler(CommandHandler("uptime", uptime_command))
 
     async def run():
-        await source_client.start()
-        me = await source_client.get_me()
-        print(f"Source reader account online: {me.first_name} (@{me.username})", flush=True)
+        await app.start()
+        me = await app.get_me()
+        print(f"Userbot session online: {me.first_name} (@{me.username})", flush=True)
 
         await start_web_server()
 
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        print("Target Bot polling started.", flush=True)
+        await ptb_app.initialize()
+        await ptb_app.start()
+        await ptb_app.updater.start_polling(drop_pending_updates=True)
+        print("Status bot (/ping, /uptime) polling started.", flush=True)
 
         await asyncio.Event().wait()
 
@@ -825,7 +734,7 @@ def main():
         asyncio.run(run())
     finally:
         try:
-            asyncio.run(source_client.stop())
+            asyncio.run(app.stop())
         except Exception:
             pass
 
