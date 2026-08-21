@@ -2,7 +2,7 @@ import os
 import re
 import copy
 import time
-import sqlite3Twelve Dev, [22.08.2026 01:24]
+import sqlite3
 import os
 import re
 import copy
