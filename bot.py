@@ -712,9 +712,42 @@ async def start_web_server():
 def main():
     init_db()
 
-    ptb_app = Application.builder().token(BOT_TOKEN).build()
-    ptb_app.add_handler(CommandHandler("ping", ping_command))
-    ptb_app.add_handler(CommandHandler("uptime", uptime_command))
+    async def run_status_bot():
+        """Runs in its own supervised loop so a Telegram-side Conflict
+        (another instance polling the same BOT_TOKEN) or any other network
+        error here can NEVER take down the userbot/session side."""
+        while True:
+            ptb_app = Application.builder().token(BOT_TOKEN).build()
+            ptb_app.add_handler(CommandHandler("ping", ping_command))
+            ptb_app.add_handler(CommandHandler("uptime", uptime_command))
+            try:
+                await ptb_app.initialize()
+                await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+                await ptb_app.start()
+                await ptb_app.updater.start_polling(drop_pending_updates=True)
+                print("Status bot (/ping, /uptime) polling started.", flush=True)
+
+                # Stay here until something goes wrong.
+                while ptb_app.updater.running:
+                    await asyncio.sleep(5)
+
+            except Exception as e:
+                print(f"Status bot error: {e}", flush=True)
+
+            finally:
+                try:
+                    if ptb_app.updater.running:
+                        await ptb_app.updater.stop()
+                except Exception:
+                    pass
+                try:
+                    await ptb_app.stop()
+                    await ptb_app.shutdown()
+                except Exception:
+                    pass
+
+            print("Status bot restarting in 15s...", flush=True)
+            await asyncio.sleep(15)
 
     async def run():
         await app.start()
@@ -723,10 +756,9 @@ def main():
 
         await start_web_server()
 
-        await ptb_app.initialize()
-        await ptb_app.start()
-        await ptb_app.updater.start_polling(drop_pending_updates=True)
-        print("Status bot (/ping, /uptime) polling started.", flush=True)
+        # Status bot runs as an isolated background task — its failures
+        # are contained and don't affect the userbot (/clone etc.).
+        asyncio.create_task(run_status_bot())
 
         await asyncio.Event().wait()
 
