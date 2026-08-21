@@ -192,8 +192,6 @@ def normalize_chat(value):
         parts = value.split("/")
 
         if len(parts) >= 4:
-
-            # https://t.me/username
             value = parts[3]
 
     value = value.replace("@", "")
@@ -254,8 +252,6 @@ def rewrite_telegram_url(
     if not match:
         return url
 
-    chat_part = match.group(1)
-
     first_id = match.group(2)
     second_id = match.group(3)
 
@@ -277,12 +273,10 @@ def rewrite_telegram_url(
 
     target_chat, target_topic, target_msg = mapped
 
-    # Public username target.
     target_chat_clean = str(
         target_chat
     ).replace("-100", "")
 
-    # For public target chats.
     if str(target_chat).lstrip("-").isdigit():
         return (
             f"https://t.me/c/"
@@ -321,67 +315,6 @@ def get_entities(message):
         return message.caption_entities
 
     return []
-
-
-# =========================================================
-# ENTITY-AWARE TEXT PROCESSING
-# =========================================================
-
-def process_message_text(
-    message,
-    config,
-    source_chat
-):
-
-    text = get_message_text(message)
-
-    if not text:
-        return "", []
-
-    entities = get_entities(message)
-
-    # -----------------------------------------------------
-    # First pass: replace hyperlinks inside entities
-    # -----------------------------------------------------
-
-    rewritten_urls = {}
-
-    for entity in entities:
-
-        if entity.type in (
-            MessageEntityType.TEXT_LINK,
-            MessageEntityType.URL,
-        ):
-
-            try:
-
-                if entity.type == MessageEntityType.TEXT_LINK:
-
-                    old_url = entity.url
-
-                    new_url = rewrite_telegram_url(
-                        old_url,
-                        source_chat,
-                        config
-                    )
-
-                    rewritten_urls[
-                        id(entity)
-                    ] = new_url
-
-            except Exception:
-                pass
-
-    # -----------------------------------------------------
-    # Plain text processing
-    # -----------------------------------------------------
-
-    processed = replace_plain_text(
-        text,
-        config
-    )
-
-    return processed, entities
 
 
 # =========================================================
@@ -442,9 +375,6 @@ async def send_text_message(
 
     if target_topic:
         kwargs["message_thread_id"] = target_topic
-
-    # Telegram Bot API will preserve entities
-    # when supplied explicitly.
 
     if message.entities:
 
@@ -578,10 +508,6 @@ async def send_media_message(
     if caption:
         kwargs["caption"] = caption
 
-    # -----------------------------------------------------
-    # PHOTO
-    # -----------------------------------------------------
-
     if message.photo:
 
         return await target_bot.send_photo(
@@ -589,10 +515,6 @@ async def send_media_message(
             photo=message.photo.file_id,
             **kwargs
         )
-
-    # -----------------------------------------------------
-    # VIDEO
-    # -----------------------------------------------------
 
     if message.video:
 
@@ -602,10 +524,6 @@ async def send_media_message(
             **kwargs
         )
 
-    # -----------------------------------------------------
-    # DOCUMENT
-    # -----------------------------------------------------
-
     if message.document:
 
         return await target_bot.send_document(
@@ -613,10 +531,6 @@ async def send_media_message(
             document=message.document.file_id,
             **kwargs
         )
-
-    # -----------------------------------------------------
-    # AUDIO
-    # -----------------------------------------------------
 
     if message.audio:
 
@@ -626,10 +540,6 @@ async def send_media_message(
             **kwargs
         )
 
-    # -----------------------------------------------------
-    # VOICE
-    # -----------------------------------------------------
-
     if message.voice:
 
         return await target_bot.send_voice(
@@ -637,10 +547,6 @@ async def send_media_message(
             voice=message.voice.file_id,
             **kwargs
         )
-
-    # -----------------------------------------------------
-    # ANIMATION
-    # -----------------------------------------------------
 
     if message.animation:
 
@@ -654,7 +560,7 @@ async def send_media_message(
 
 
 # =========================================================
-# CLONE
+# CLONE (Updated with individual message fetching loop)
 # =========================================================
 
 async def clone_command(
@@ -709,69 +615,34 @@ async def clone_command(
         update.effective_user.id
     )
 
-    total = max(
-        0,
-        to_id - from_id + 1
-    )
-
     status = await update.effective_message.reply_text(
         "🚀 Transfer started..."
     )
 
     success = 0
     failed = 0
+    total_messages = range(from_id, to_id + 1)
+    total_count = len(total_messages)
 
     # -----------------------------------------------------
-    # SOURCE HISTORY
+    # TRANSFER LOOP
     # -----------------------------------------------------
 
-    try:
+    for index, msg_id in enumerate(total_messages, start=1):
 
-        messages = []
+        try:
+            # Fetch message individually to avoid BOT_METHOD_INVALID error
+            message = await source_client.get_messages(source, msg_id)
 
-        async for message in source_client.get_chat_history(
-            source
-        ):
-
-            if message.id < from_id:
-                break
-
-            if message.id > to_id:
+            if not message or message.empty:
+                failed += 1
                 continue
 
             # Topic filtering.
             if src_topic:
-
-                message_topic = (
-                    message.message_thread_id
-                    or 0
-                )
-
+                message_topic = message.message_thread_id or 0
                 if message_topic != src_topic:
                     continue
-
-            messages.append(message)
-
-        messages.reverse()
-
-    except Exception as e:
-
-        await status.edit_text(
-            f"❌ Could not read source chat:\n{e}"
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # TRANSFER
-    # -----------------------------------------------------
-
-    for index, message in enumerate(
-        messages,
-        start=1
-    ):
-
-        try:
 
             result = None
 
@@ -820,8 +691,11 @@ async def clone_command(
             )
 
             try:
+                message = await source_client.get_messages(source, msg_id)
+                if not message or message.empty:
+                    failed += 1
+                    continue
 
-                # Retry same message.
                 if message.text:
 
                     result = await send_text_message(
@@ -859,9 +733,7 @@ async def clone_command(
                 failed += 1
 
                 print(
-                    f"Retry failed "
-                    f"{message.id}: "
-                    f"{retry_error}",
+                    f"Retry failed {msg_id}: {retry_error}",
                     flush=True
                 )
 
@@ -870,8 +742,7 @@ async def clone_command(
             failed += 1
 
             print(
-                f"Transfer error "
-                f"{message.id}: {e}",
+                f"Transfer error {msg_id}: {e}",
                 flush=True
             )
 
@@ -882,12 +753,12 @@ async def clone_command(
         if (
             index == 1
             or index % 5 == 0
-            or index == len(messages)
+            or index == total_count
         ):
 
             percentage = (
-                index / len(messages) * 100
-                if messages
+                index / total_count * 100
+                if total_count
                 else 100
             )
 
@@ -895,7 +766,7 @@ async def clone_command(
 
                 await status.edit_text(
                     "⏳ Bulk Transfer\n\n"
-                    f"Processed: `{index}/{len(messages)}`\n"
+                    f"Processed: `{index}/{total_count}`\n"
                     f"Success: `{success}`\n"
                     f"Failed: `{failed}`\n"
                     f"Progress: `{percentage:.1f}%`"
@@ -918,7 +789,7 @@ async def clone_command(
             "🏁 Bulk Transfer Completed\n\n"
             f"✅ Success: `{success}`\n"
             f"❌ Failed: `{failed}`\n"
-            f"📦 Total: `{len(messages)}`"
+            f"📦 Total: `{total_count}`"
         )
 
     except TelegramError:
