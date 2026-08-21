@@ -434,7 +434,7 @@ CMD_FILTER = filters.me & filters.command(
 )
 
 
-@app.on_message(filters.all)
+@app.on_message(filters.all, group=-1)
 async def debug_all_messages(client, message):
     # Temporary diagnostic log — shows in Render logs for EVERY message
     # this session sees, so we can tell if a command even arrives / matches.
