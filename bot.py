@@ -464,30 +464,61 @@ async def send_one(message, target_chat, target_topic, config, source_chat, sour
 # FETCH SOURCE HISTORY (fixed topic filtering)
 # =========================================================
 
+def _message_topic_id(message):
+    """Best-effort topic id for a message, across pyrogram fork differences."""
+    for attr in ("message_thread_id", "reply_to_top_message_id"):
+        tid = getattr(message, attr, None)
+        if tid:
+            return tid
+
+    # Fallback: a message that is a direct reply to the topic's own root
+    # message belongs to that topic even if neither field above is set.
+    reply_to = getattr(message, "reply_to_message_id", None)
+    if reply_to:
+        return reply_to
+
+    return None
+
+
 async def fetch_source_messages(source, src_topic, from_id, to_id):
     await ensure_source_access(source)
 
     messages = []
-    try:
-        if src_topic:
-            # search_messages supports server-side topic filtering via
-            # message_thread_id — get_chat_history does NOT, which is why
-            # the old code silently skipped every topic message.
-            iterator = source_client.search_messages(source, message_thread_id=src_topic)
-        else:
-            iterator = source_client.get_chat_history(source)
+    seen_topic_ids = set()
 
-        async for message in iterator:
+    try:
+        # We deliberately always walk full chat history and filter by topic
+        # client-side (rather than relying on server-side thread filters),
+        # since that parameter's name/behavior is inconsistent across
+        # pyrogram forks and silently returned nothing on some setups.
+        async for message in source_client.get_chat_history(source):
             if message.id < from_id:
                 break
             if message.id > to_id:
                 continue
+
+            if src_topic:
+                tid = _message_topic_id(message)
+                if tid:
+                    seen_topic_ids.add(tid)
+                if tid != src_topic:
+                    continue
+
             messages.append(message)
 
     except RPCError as e:
         raise RuntimeError(str(e))
 
     messages.reverse()
+
+    if src_topic and not messages and seen_topic_ids:
+        raise RuntimeError(
+            f"Topic ID {src_topic} ka koi message range me nahi mila. "
+            f"Is range me ye topic IDs mile: {sorted(seen_topic_ids)}. "
+            "Sahi Src_Topic_ID check karo (topic ke pehle message ka link kholo, "
+            "URL me .../<chat>/<topic_id>/<msg_id> hota hai)."
+        )
+
     return messages
 
 
