@@ -22,7 +22,13 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 PORT = int(os.environ.get("PORT", "10000"))
-PYROGRAM_SESSION = os.environ.get("PYROGRAM_SESSION", "source_reader_bot")
+
+# A regular Telegram USER session (see generate_session.py), NOT the bot
+# account. This is what lets the source chat be read automatically —
+# bot accounts cannot see history from before they joined a chat, and
+# generally can't self-join channels at all. The bot account is still
+# used for TARGET sending, where you keep it as admin as before.
+SESSION_STRING = os.environ["SESSION_STRING"]
 
 
 # =========================================================
@@ -107,14 +113,15 @@ def get_mapping(source_chat, source_topic, source_msg_id):
 
 
 # =========================================================
-# PYROGRAM SOURCE CLIENT (reads source chat)
+# PYROGRAM SOURCE CLIENT (reads source chat — a USER account, not the bot)
 # =========================================================
 
 source_client = Client(
-    PYROGRAM_SESSION,
+    "source_reader_user",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
+    session_string=SESSION_STRING,
+    in_memory=True,
 )
 
 target_bot = None  # set in main()
@@ -160,15 +167,16 @@ async def ensure_source_access(chat):
             return
         except Exception as e:
             raise RuntimeError(
-                "Source group/channel me bot khud join nahi ho paya.\n"
-                "Ye sirf tab automatic hota hai jab source PUBLIC ho "
+                "Source group/channel me apne aap join nahi ho paya.\n"
+                "Ye automatic tabhi hota hai jab source PUBLIC ho "
                 "(username wala link/handle).\n"
                 f"Error: {e}"
             )
 
     raise RuntimeError(
-        "Source private hai (sirf numeric ID diya gaya) — private chat me "
-        "bot ko khud add nahi kar sakta, wahan bhi bot ko manually add karna hoga."
+        "Source private hai (sirf numeric ID diya gaya) — private chat "
+        "me khud join nahi ho sakte, wahan aapke (SESSION_STRING wale) "
+        "account ko manually add karna hoga."
     )
 
 
@@ -604,8 +612,9 @@ async def start_command(update, context):
         "/setcaptionreplace old | new  (jab captionmode = replace ho)\n"
         "/status\n"
         "/reset\n\n"
-        "Source group/channel PUBLIC hone par bot khud access le lega — "
-        "sirf TARGET group me bot ko admin banana zaroori hai."
+        "Source group/channel/topic PUBLIC hone par apne aap access mil jayega "
+        "(SESSION_STRING wale account se) — sirf TARGET group me is bot ko "
+        "admin banana zaroori hai."
     )
 
 
@@ -770,7 +779,7 @@ def main():
     async def run():
         await source_client.start()
         me = await source_client.get_me()
-        print(f"Pyrogram source client online: @{me.username}", flush=True)
+        print(f"Source reader account online: {me.first_name} (@{me.username})", flush=True)
 
         await start_web_server()
 
