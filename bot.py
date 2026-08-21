@@ -434,6 +434,20 @@ CMD_FILTER = filters.me & filters.command(
 )
 
 
+@app.on_message(filters.all)
+async def debug_all_messages(client, message):
+    # Temporary diagnostic log — shows in Render logs for EVERY message
+    # this session sees, so we can tell if a command even arrives / matches.
+    try:
+        print(
+            f"[DEBUG] chat={message.chat.id} from={getattr(message.from_user, 'id', None)} "
+            f"outgoing={message.outgoing} text={message.text!r}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[DEBUG] logging failed: {e}", flush=True)
+
+
 @app.on_message(CMD_FILTER)
 async def control_router(client, message):
     cmd = message.command[0].lower()
@@ -451,7 +465,14 @@ async def control_router(client, message):
         "help": cmd_help,
     }
 
-    await handlers[cmd](message, args)
+    try:
+        await handlers[cmd](message, args)
+    except Exception as e:
+        print(f"[ERROR] /{cmd} failed: {e}", flush=True)
+        try:
+            await message.reply_text(f"❌ /{cmd} me error aaya:\n`{e}`")
+        except Exception:
+            pass
 
 
 async def cmd_help(message, args):
@@ -540,7 +561,9 @@ async def cmd_clone(message, args):
 
         except Exception as e:
             failed += 1
+            import traceback
             print(f"Transfer error {message_item.id}: {e}", flush=True)
+            traceback.print_exc()
 
         if index == 1 or index % 5 == 0 or index == total:
             percentage = index / total * 100
