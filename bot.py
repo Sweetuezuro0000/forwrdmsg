@@ -147,7 +147,6 @@ async def ensure_access(chat):
     except Exception as first_err:
         err = first_err
 
-Twelve Dev, [22.08.2026 01:24]
 if isinstance(chat, str):
         try:
             await app.join_chat(chat)
@@ -278,7 +277,6 @@ def process_text_or_caption(raw_text, entities, config, source_chat, source_topi
         text = f"{prefix}{text}{suffix}"
         return (text or None) if is_caption else text, None
 
-Twelve Dev, [22.08.2026 01:24]
 shift = utf16_len(prefix)
     new_entities = build_entities(entities, shift, source_chat, source_topic)
     final_text = f"{prefix}{raw_text}{suffix}"
