@@ -1,9 +1,6 @@
 import os
-import re
 import sqlite3
 import asyncio
-from typing import Optional
-
 from aiohttp import web
 
 from telegram import Update, BotCommand
@@ -21,28 +18,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", "10000"))
-
-
-# =========================================================
-# USER CONFIG
-# =========================================================
-
-USER_CONFIGS = {}
-
-
-def default_config():
-    return {
-        "prefix": "",
-        "suffix": "",
-        "replace_from": "",
-        "replace_to": "",
-    }
-
-
-def get_config(user_id):
-    if user_id not in USER_CONFIGS:
-        USER_CONFIGS[user_id] = default_config()
-    return USER_CONFIGS[user_id]
 
 
 # =========================================================
@@ -118,9 +93,14 @@ def normalize_chat(value):
         parts = value.split("/")
         if len(parts) >= 4:
             value = parts[3]
-    value = value.replace("@", "")
+    
+    # Agar username hai toh '@' laga rehene dein ya hata dein, Telegram API username (@channel) accept kar leta hai public ke liye
     if value.lstrip("-").isdigit():
         return int(value)
+    
+    if not value.startswith("@") and not value.lstrip("-").isdigit():
+        return "@" + value
+        
     return value
 
 
@@ -131,7 +111,8 @@ def normalize_chat(value):
 async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
-    /clone SourceGroup TargetGroup From_ID To_ID Source_Topic_ID Target_Topic_ID
+    /clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]
+    Example: /clone @public_channel -10022222222 1 50 0 12
     """
     if not update.effective_message:
         return
@@ -140,10 +121,9 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 4:
         await update.effective_message.reply_text(
             "⚠️ **Sahi tarika use karein:**\n\n"
-            "`/clone SourceTarget FromID ToID [SrcTopicID] [TgtTopicID]`\n\n"
-            "Example (Agar topics hain):\n"
-            "`/clone -10012345 -10098765 1 50 12 45`\n"
-            "(Yahan 12 Source Topic ID hai aur 45 Target Topic ID hai)"
+            "`/clone Source Target FromID ToID [SrcTopicID] [TgtTopicID]`\n\n"
+            "Example:\n"
+            "`/clone @public_channel -10098765 1 50 0 12`"
         )
         return
 
@@ -154,15 +134,14 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_id = int(args[2])
         to_id = int(args[3])
         
-        # Agar topic IDs di gayi hain toh unhe integer lein, warna 0 (General/Normal chat)
         src_topic = int(args[4]) if len(args) > 4 else 0
         tgt_topic = int(args[5]) if len(args) > 5 else 0
         
     except ValueError:
-        await update.effective_message.reply_text("❌ Saare IDs numbers hone chahiye.")
+        await update.effective_message.reply_text("❌ IDs numbers honi chahiye.")
         return
 
-    status = await update.effective_message.reply_text("🚀 Topic Transfer shuru ho gaya hai...")
+    status = await update.effective_message.reply_text("🚀 Transfer shuru ho gaya hai...")
 
     success = 0
     failed = 0
@@ -170,7 +149,6 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for msg_id in range(from_id, to_id + 1):
         try:
-            # Bot API ka copy_message function
             kwargs = {}
             if tgt_topic:
                 kwargs["message_thread_id"] = tgt_topic
@@ -230,15 +208,14 @@ async def clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update, context):
     await update.effective_message.reply_text(
-        "🚀 **Topic Transfer Bot**\n\n"
+        "🚀 **Public Channel to Topic Bot**\n\n"
         "Command format:\n"
-        "`/clone Source Target FromID ToID SrcTopicID TgtTopicID`\n\n"
-        "Note: Bot ka source aur target dono groups mein **Admin** hona aur messages padhne ki permission hona zaroori hai."
+        "`/clone @source_channel TargetID FromID ToID [SrcTopicID] [TgtTopicID]`"
     )
 
 
 # =========================================================
-# WEB SERVER (Hosting uptime ke liye)
+# WEB SERVER
 # =========================================================
 
 async def home(request):
@@ -258,7 +235,7 @@ async def start_web_server():
 async def setup_commands(application):
     await application.bot.set_my_commands([
         BotCommand("start", "Start bot"),
-        BotCommand("clone", "Transfer messages between topics"),
+        BotCommand("clone", "Transfer messages"),
     ])
 
 
@@ -271,6 +248,8 @@ async def error_handler(update, context):
 # =========================================================
 
 def main():
+    init_db()
+    
     application = (
         Application.builder()
         .token(BOT_TOKEN)
