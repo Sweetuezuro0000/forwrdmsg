@@ -414,7 +414,7 @@ def owner_only(handler):
                     "⛔ Ye command aapke liye disabled hai.\n\n"
                     f"Aapki Telegram user ID: `{user.id}`\n"
                     f"Deploy me set kiya OWNER_ID: `{OWNER_ID}`\n\n"
-                    "Ye dono match nahi kar rahe. Render env vars me OWNER_ID "
+                    "Ye dono match nahi kar rahe. env vars me OWNER_ID "
                     f"ko `{user.id}` set karo aur redeploy karo."
                 )
             return
