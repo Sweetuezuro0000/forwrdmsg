@@ -3,381 +3,49 @@ import re
 import copy
 import time
 import sqlite3
-import os
-import re
-import copy
-import time
-import sqlite3
 import asyncio
 
 from aiohttp import web
-
 from pyrogram import Client
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait, RPCError
-
-# =========================================================
-# ENVIRONMENT
-# =========================================================
-
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]   # your account — reads source, sends to target
-
-BOT_TOKEN = os.environ["BOT_TOKEN"]             # all commands (incl. /clone) go through this bot
-OWNER_ID = int(os.environ["OWNER_ID"])          # your numeric Telegram user id — only you can command it
-PORT = int(os.environ.get("PORT", "10000"))
-
-START_TIME = time.time()
-
-
-# =========================================================
-# CONFIG (single owner)
-# =========================================================
-
-def default_config():
-    return {
-        "prefix": "",
-        "suffix": "",
-
-        "replace_from": "",
-        "replace_to": "",
-
-        # caption_mode: keep | remove | replace
-        "caption_mode": "keep",
-        "caption_replace_from": "",
-        "caption_replace_to": "",
-    }
-
-
-CONFIG = default_config()
-
-
-# =========================================================
-# DATABASE (source msg -> target msg mapping, used for link rewrite)
-# =========================================================
-
-DB_FILE = "link_mapping.db"
-
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS mappings (
-            source_chat TEXT NOT NULL,
-            source_topic INTEGER NOT NULL DEFAULT 0,
-            source_msg_id INTEGER NOT NULL,
-
-            target_chat TEXT NOT NULL,
-            target_topic INTEGER NOT NULL DEFAULT 0,
-            target_msg_id INTEGER NOT NULL,
-
-            PRIMARY KEY (source_chat, source_topic, source_msg_id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def save_mapping(source_chat, source_topic, source_msg_id,
-                  target_chat, target_topic, target_msg_id):
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        INSERT OR REPLACE INTO mappings
-        (source_chat, source_topic, source_msg_id,
-         target_chat, target_topic, target_msg_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        str(source_chat), int(source_topic or 0), int(source_msg_id),
-        str(target_chat), int(target_topic or 0), int(target_msg_id),
-    ))
-    conn.commit()
-    conn.close()
-
-
-def get_mapping(source_chat, source_topic, source_msg_id):
-    conn = sqlite3.connect(DB_FILE)
-    row = conn.execute("""
-        SELECT target_chat, target_topic, target_msg_id
-        FROM mappings
-        WHERE source_chat = ? AND source_topic = ? AND source_msg_id = ?
-    """, (str(source_chat), int(source_topic or 0), int(source_msg_id))).fetchone()
-    conn.close()
-    return row
-
-
-# =========================================================
-# PYROGRAM CLIENT — YOUR ACCOUNT. Reads source AND sends to target.
-# =========================================================
-
-app = Client(
-    "userbot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    in_memory=True,
-)
-
-
-# =========================================================
-# CHAT NORMALIZATION
-# =========================================================
-
-def normalize_chat(value):
-    value = str(value).strip()
-
-    if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
-        value = value.rstrip("/")
-        parts = value.split("/")
-        if len(parts) >= 4:
-            value = parts[3]
-
-    value = value.replace("@", "")
-
-    if value.lstrip("-").isdigit():
-        return int(value)
-
-    return value
-
-
-async def ensure_access(chat):
-    try:
-        await app.get_chat(chat)
-        return
-    except Exception as first_err:
-        err = first_err
-
-if isinstance(chat, str):
-        try:
-            await app.join_chat(chat)
-            return
-        except Exception as e:
-            raise RuntimeError(f"Public chat '{chat}' me join nahi ho paya.\nError: {e}")
-
-    raise RuntimeError(
-        f"Chat ID {chat} access nahi ho raha. Aapka session-account is chat "
-        f"ka member hona chahiye.\nError: {err}"
-    )
-
-
-# =========================================================
-# UTF-16 HELPERS
-# =========================================================
-
-def utf16_len(text):
-    if not text:
-        return 0
-    return len(text.encode("utf-16-le")) // 2
-
-
-# =========================================================
-# TELEGRAM LINK REWRITING
-# =========================================================
-
-TELEGRAM_LINK_PATTERN = re.compile(
-    r"https?://t\.me/"
-    r"(c/\d+|[A-Za-z0-9_]+)"
-    r"(?:/(\d+))?"
-    r"(?:/(\d+))?"
-)
-
-
-def _build_target_link(target_chat, target_topic, target_msg):
-    target_chat_str = str(target_chat)
-
-    if target_chat_str.lstrip("-").isdigit():
-        cid = target_chat_str.replace("-100", "")
-        if target_topic:
-            return f"https://t.me/c/{cid}/{target_topic}/{target_msg}"
-        return f"https://t.me/c/{cid}/{target_msg}"
-
-    if target_topic:
-        return f"https://t.me/{target_chat_str}/{target_topic}/{target_msg}"
-    return f"https://t.me/{target_chat_str}/{target_msg}"
-
-
-def rewrite_telegram_url(url, source_chat, source_topic):
-    if not url:
-        return url
-
-    match = TELEGRAM_LINK_PATTERN.fullmatch(url.strip())
-    if not match:
-        return url
-
-    first_id = match.group(2)
-    second_id = match.group(3)
-    if not first_id:
-        return url
-
-    message_id = int(second_id or first_id)
-
-    mapped = get_mapping(source_chat, source_topic or 0, message_id)
-    if not mapped:
-        return url
-
-    target_chat, target_topic, target_msg = mapped
-    return _build_target_link(target_chat, target_topic, target_msg)
-
-
-def rewrite_plain_urls(text, source_chat, source_topic):
-    if not text:
-        return text
-
-    def _sub(m):
-        return rewrite_telegram_url(m.group(0), source_chat, source_topic)
-
-    return TELEGRAM_LINK_PATTERN.sub(_sub, text)
-
-
-# =========================================================
-# ENTITY HANDLING (Pyrogram objects reused directly — same client sends)
-# =========================================================
-
-def clone_entity(entity, offset_shift, url_override=None):
-    new_entity = copy.copy(entity)
-    new_entity.offset = entity.offset + offset_shift
-    if url_override is not None and entity.type == MessageEntityType.TEXT_LINK:
-        new_entity.url = url_override
-    return new_entity
-
-
-def build_entities(entities, offset_shift, source_chat, source_topic):
-    result = []
-    for e in entities or []:
-        url_override = None
-        if e.type == MessageEntityType.TEXT_LINK:
-            url_override = rewrite_telegram_url(e.url, source_chat, source_topic)
-        try:
-            result.append(clone_entity(e, offset_shift, url_override))
-        except Exception:
-            continue
-    return result
-
-
-def process_text_or_caption(raw_text, entities, config, source_chat, source_topic,
-                             is_caption=False):
-    raw_text = raw_text or ""
-
-    if is_caption:
-        mode = config["caption_mode"]
-        if mode == "remove":
-            return None, None
-        replace_from = config["caption_replace_from"] if mode == "replace" else ""
-        replace_to = config["caption_replace_to"] if mode == "replace" else ""
-    else:
-        replace_from = config["replace_from"]
-        replace_to = config["replace_to"]
-
-    prefix = config["prefix"]
-    suffix = config["suffix"]
-
-    if replace_from:
-        text = raw_text.replace(replace_from, replace_to)
-        text = rewrite_plain_urls(text, source_chat, source_topic)
-        text = f"{prefix}{text}{suffix}"
-        return (text or None) if is_caption else text, None
-
-shift = utf16_len(prefix)
-    new_entities = build_entities(entities, shift, source_chat, source_topic)
-    final_text = f"{prefix}{raw_text}{suffix}"
-
-    return (final_text or None), (new_entities or None)
-
-
-# =========================================================
-# RENDER FREE TIER COMPATIBLE WEB SERVER
-# =========================================================
-
-async def web_home(request):
-    return web.Response(text="Bot runs perfectly on Render Free Tier Web Service!")
-
-
-async def start_web_server():
-    server = web.Application()
-    server.add_routes([web.get('/', web_home)])
-    runner = web.AppRunner(server)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"[Web Server] Listening on port {PORT}")
-
-
-# =========================================================
-# MAIN ENTRY POINT
-# =========================================================
-
-async def main():
-    # Database initialization
-    init_db()
-
-    # 1. Start Web Server first to prevent Render's port bind crash
-    await start_web_server()
-
-    # 2. Start Pyrogram Userbot Client
-    print("[Pyrogram] Starting client...")
-    await app.start()
-    print("[Pyrogram] Client started successfully!")
-
-    # 3. Block loop to keep services alive
-    await asyncio.Event().wait()
-
-
-if name == "main":
-    asyncio.run(main())
-import asyncio
-
-from aiohttp import web
-
-from pyrogram import Client
-from pyrogram.enums import MessageEntityType
-from pyrogram.errors import FloodWait, RPCError
-
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-
 # =========================================================
 # ENVIRONMENT
 # =========================================================
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]   # your account — reads source, sends to target
-
-BOT_TOKEN = os.environ["BOT_TOKEN"]             # all commands (incl. /clone) go through this bot
-OWNER_ID = int(os.environ["OWNER_ID"])          # your numeric Telegram user id — only you can command it
+SESSION_STRING = os.environ["SESSION_STRING"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
 PORT = int(os.environ.get("PORT", "10000"))
 
 START_TIME = time.time()
 
-
 # =========================================================
-# CONFIG (single owner)
+# CONFIG
 # =========================================================
 
 def default_config():
     return {
         "prefix": "",
         "suffix": "",
-
         "replace_from": "",
         "replace_to": "",
-
-        # caption_mode: keep | remove | replace
         "caption_mode": "keep",
         "caption_replace_from": "",
         "caption_replace_to": "",
     }
 
-
 CONFIG = default_config()
 
-
 # =========================================================
-# DATABASE (source msg -> target msg mapping, used for link rewrite)
+# DATABASE
 # =========================================================
 
 DB_FILE = "link_mapping.db"
-
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -386,20 +54,17 @@ def init_db():
             source_chat TEXT NOT NULL,
             source_topic INTEGER NOT NULL DEFAULT 0,
             source_msg_id INTEGER NOT NULL,
-
             target_chat TEXT NOT NULL,
             target_topic INTEGER NOT NULL DEFAULT 0,
             target_msg_id INTEGER NOT NULL,
-
             PRIMARY KEY (source_chat, source_topic, source_msg_id)
         )
     """)
     conn.commit()
     conn.close()
 
-
 def save_mapping(source_chat, source_topic, source_msg_id,
-                  target_chat, target_topic, target_msg_id):
+                 target_chat, target_topic, target_msg_id):
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""
         INSERT OR REPLACE INTO mappings
@@ -413,20 +78,20 @@ def save_mapping(source_chat, source_topic, source_msg_id,
     conn.commit()
     conn.close()
 
-
 def get_mapping(source_chat, source_topic, source_msg_id):
     conn = sqlite3.connect(DB_FILE)
     row = conn.execute("""
         SELECT target_chat, target_topic, target_msg_id
         FROM mappings
         WHERE source_chat = ? AND source_topic = ? AND source_msg_id = ?
-    """, (str(source_chat), int(source_topic or 0), int(source_msg_id))).fetchone()
+    """, (
+        str(source_chat), int(source_topic or 0), int(source_msg_id)
+    )).fetchone()
     conn.close()
     return row
 
-
 # =========================================================
-# PYROGRAM CLIENT — YOUR ACCOUNT. Reads source AND sends to target.
+# PYROGRAM USER ACCOUNT
 # =========================================================
 
 app = Client(
@@ -437,15 +102,14 @@ app = Client(
     in_memory=True,
 )
 
-
 # =========================================================
-# CHAT NORMALIZATION
+# CHAT HELPERS
 # =========================================================
 
 def normalize_chat(value):
     value = str(value).strip()
 
-    if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
+    if value.startswith(("https://t.me/", "http://t.me/")):
         value = value.rstrip("/")
         parts = value.split("/")
         if len(parts) >= 4:
@@ -458,40 +122,34 @@ def normalize_chat(value):
 
     return value
 
-
 async def ensure_access(chat):
     try:
         await app.get_chat(chat)
         return
     except Exception as first_err:
-        err = first_err
+        if isinstance(chat, str):
+            try:
+                await app.join_chat(chat)
+                return
+            except Exception as e:
+                raise RuntimeError(
+                    f"Public chat '{chat}' me join nahi ho paya.\nError: {e}"
+                ) from e
 
-    if isinstance(chat, str):
-        try:
-            await app.join_chat(chat)
-            return
-        except Exception as e:
-            raise RuntimeError(f"Public chat '{chat}' me join nahi ho paya.\nError: {e}")
-
-    raise RuntimeError(
-        f"Chat ID {chat} access nahi ho raha. Aapka session-account is chat "
-        f"ka member hona chahiye.\nError: {err}"
-    )
-
+        raise RuntimeError(
+            f"Chat ID {chat} access nahi ho raha. "
+            f"Aapka session-account is chat ka member hona chahiye.\n"
+            f"Error: {first_err}"
+        )
 
 # =========================================================
-# UTF-16 HELPERS
+# UTF-16 / LINK HELPERS
 # =========================================================
 
 def utf16_len(text):
     if not text:
         return 0
     return len(text.encode("utf-16-le")) // 2
-
-
-# =========================================================
-# TELEGRAM LINK REWRITING
-# =========================================================
 
 TELEGRAM_LINK_PATTERN = re.compile(
     r"https?://t\.me/"
@@ -500,20 +158,24 @@ TELEGRAM_LINK_PATTERN = re.compile(
     r"(?:/(\d+))?"
 )
 
-
 def _build_target_link(target_chat, target_topic, target_msg):
     target_chat_str = str(target_chat)
 
     if target_chat_str.lstrip("-").isdigit():
-        cid = target_chat_str.replace("-100", "")
+        cid = target_chat_str
+        if cid.startswith("-100"):
+            cid = cid[4:]
+        elif cid.startswith("-"):
+            cid = cid[1:]
+
         if target_topic:
             return f"https://t.me/c/{cid}/{target_topic}/{target_msg}"
         return f"https://t.me/c/{cid}/{target_msg}"
 
+    target_chat_str = target_chat_str.lstrip("@")
     if target_topic:
         return f"https://t.me/{target_chat_str}/{target_topic}/{target_msg}"
     return f"https://t.me/{target_chat_str}/{target_msg}"
-
 
 def rewrite_telegram_url(url, source_chat, source_topic):
     if not url:
@@ -525,64 +187,88 @@ def rewrite_telegram_url(url, source_chat, source_topic):
 
     first_id = match.group(2)
     second_id = match.group(3)
+
     if not first_id:
         return url
 
     message_id = int(second_id or first_id)
-
     mapped = get_mapping(source_chat, source_topic or 0, message_id)
+
     if not mapped:
         return url
 
     target_chat, target_topic, target_msg = mapped
     return _build_target_link(target_chat, target_topic, target_msg)
 
-
 def rewrite_plain_urls(text, source_chat, source_topic):
     if not text:
         return text
 
-    def _sub(m):
-        return rewrite_telegram_url(m.group(0), source_chat, source_topic)
-
-    return TELEGRAM_LINK_PATTERN.sub(_sub, text)
-
+    return TELEGRAM_LINK_PATTERN.sub(
+        lambda m: rewrite_telegram_url(
+            m.group(0), source_chat, source_topic
+        ),
+        text,
+    )
 
 # =========================================================
-# ENTITY HANDLING (Pyrogram objects reused directly — same client sends)
+# ENTITY / TEXT PROCESSING
 # =========================================================
 
 def clone_entity(entity, offset_shift, url_override=None):
     new_entity = copy.copy(entity)
     new_entity.offset = entity.offset + offset_shift
-    if url_override is not None and entity.type == MessageEntityType.TEXT_LINK:
-        new_entity.url = url_override
-    return new_entity
 
+    if (
+        url_override is not None
+        and entity.type == MessageEntityType.TEXT_LINK
+    ):
+        new_entity.url = url_override
+
+    return new_entity
 
 def build_entities(entities, offset_shift, source_chat, source_topic):
     result = []
-    for e in entities or []:
+
+    for entity in entities or []:
         url_override = None
-        if e.type == MessageEntityType.TEXT_LINK:
-            url_override = rewrite_telegram_url(e.url, source_chat, source_topic)
+
+        if entity.type == MessageEntityType.TEXT_LINK:
+            url_override = rewrite_telegram_url(
+                entity.url, source_chat, source_topic
+            )
+
         try:
-            result.append(clone_entity(e, offset_shift, url_override))
-        except Exception:
-            continue
+            result.append(
+                clone_entity(entity, offset_shift, url_override)
+            )
+        except Exception as e:
+            print(f"Entity warning: {e}", flush=True)
+
     return result
 
-
-def process_text_or_caption(raw_text, entities, config, source_chat, source_topic,
-                             is_caption=False):
+def process_text_or_caption(
+    raw_text,
+    entities,
+    config,
+    source_chat,
+    source_topic,
+    is_caption=False,
+):
     raw_text = raw_text or ""
 
     if is_caption:
         mode = config["caption_mode"]
+
         if mode == "remove":
             return None, None
-        replace_from = config["caption_replace_from"] if mode == "replace" else ""
-        replace_to = config["caption_replace_to"] if mode == "replace" else ""
+
+        if mode == "replace":
+            replace_from = config["caption_replace_from"]
+            replace_to = config["caption_replace_to"]
+        else:
+            replace_from = ""
+            replace_to = ""
     else:
         replace_from = config["replace_from"]
         replace_to = config["replace_to"]
@@ -593,30 +279,40 @@ def process_text_or_caption(raw_text, entities, config, source_chat, source_topi
     if replace_from:
         text = raw_text.replace(replace_from, replace_to)
         text = rewrite_plain_urls(text, source_chat, source_topic)
-        text = f"{prefix}{text}{suffix}"
-        return (text or None) if is_caption else text, None
+        final_text = f"{prefix}{text}{suffix}"
+        return (final_text or None), None
 
     shift = utf16_len(prefix)
-    new_entities = build_entities(entities, shift, source_chat, source_topic)
+    new_entities = build_entities(
+        entities, shift, source_chat, source_topic
+    )
+
     final_text = f"{prefix}{raw_text}{suffix}"
 
-    if is_caption:
-        return (final_text or None), (new_entities or None)
-    return final_text, (new_entities or None)
-
+    return (
+        final_text or None,
+        new_entities or None,
+    )
 
 # =========================================================
-# SENDING (same client that read the message — file_ids stay valid)
+# SENDING
 # =========================================================
 
-async def send_text_message(message, target_chat, target_topic, config,
-                             source_chat, source_topic):
+async def send_text_message(
+    message, target_chat, target_topic, config, source_chat, source_topic
+):
     if not message.text:
         return None
 
     final_text, entities = process_text_or_caption(
-        message.text, message.entities, config, source_chat, source_topic, is_caption=False
+        message.text,
+        message.entities,
+        config,
+        source_chat,
+        source_topic,
+        False,
     )
+
     if not final_text:
         return None
 
@@ -627,12 +323,16 @@ async def send_text_message(message, target_chat, target_topic, config,
         message_thread_id=target_topic or None,
     )
 
-
-async def send_media_message(message, target_chat, target_topic, config,
-                              source_chat, source_topic):
+async def send_media_message(
+    message, target_chat, target_topic, config, source_chat, source_topic
+):
     caption_text, caption_entities = process_text_or_caption(
-        message.caption, message.caption_entities, config,
-        source_chat, source_topic, is_caption=True,
+        message.caption,
+        message.caption_entities,
+        config,
+        source_chat,
+        source_topic,
+        True,
     )
 
     kwargs = {
@@ -642,35 +342,68 @@ async def send_media_message(message, target_chat, target_topic, config,
     }
 
     if message.photo:
-        return await app.send_photo(target_chat, photo=message.photo.file_id, **kwargs)
+        return await app.send_photo(
+            target_chat, photo=message.photo.file_id, **kwargs
+        )
+
     if message.video:
-        return await app.send_video(target_chat, video=message.video.file_id, **kwargs)
+        return await app.send_video(
+            target_chat, video=message.video.file_id, **kwargs
+        )
+
     if message.document:
-        return await app.send_document(target_chat, document=message.document.file_id, **kwargs)
+        return await app.send_document(
+            target_chat, document=message.document.file_id, **kwargs
+        )
+
     if message.audio:
-        return await app.send_audio(target_chat, audio=message.audio.file_id, **kwargs)
+        return await app.send_audio(
+            target_chat, audio=message.audio.file_id, **kwargs
+        )
+
     if message.voice:
-        return await app.send_voice(target_chat, voice=message.voice.file_id, **kwargs)
+        return await app.send_voice(
+            target_chat, voice=message.voice.file_id, **kwargs
+        )
+
     if message.animation:
-        return await app.send_animation(target_chat, animation=message.animation.file_id, **kwargs)
+        return await app.send_animation(
+            target_chat, animation=message.animation.file_id, **kwargs
+        )
+
     if message.sticker:
         return await app.send_sticker(
-            target_chat, sticker=message.sticker.file_id, message_thread_id=target_topic or None
+            target_chat,
+            sticker=message.sticker.file_id,
+            message_thread_id=target_topic or None,
         )
 
     return None
 
-
-async def send_one(message, target_chat, target_topic, config, source_chat, source_topic):
+async def send_one(
+    message, target_chat, target_topic, config, source_chat, source_topic
+):
     if message.text:
-        return await send_text_message(message, target_chat, target_topic, config,
-                                        source_chat, source_topic)
-    return await send_media_message(message, target_chat, target_topic, config,
-                                     source_chat, source_topic)
+        return await send_text_message(
+            message,
+            target_chat,
+            target_topic,
+            config,
+            source_chat,
+            source_topic,
+        )
 
+    return await send_media_message(
+        message,
+        target_chat,
+        target_topic,
+        config,
+        source_chat,
+        source_topic,
+    )
 
 # =========================================================
-# FETCH SOURCE HISTORY
+# SOURCE HISTORY
 # =========================================================
 
 def _message_topic_id(message):
@@ -678,11 +411,12 @@ def _message_topic_id(message):
         tid = getattr(message, attr, None)
         if tid:
             return tid
+
     reply_to = getattr(message, "reply_to_message_id", None)
     if reply_to:
         return reply_to
-    return None
 
+    return None
 
 async def fetch_source_messages(source, src_topic, from_id, to_id):
     await ensure_access(source)
@@ -694,20 +428,23 @@ async def fetch_source_messages(source, src_topic, from_id, to_id):
         async for message in app.get_chat_history(source):
             if message.id < from_id:
                 break
+
             if message.id > to_id:
                 continue
 
             if src_topic:
                 tid = _message_topic_id(message)
+
                 if tid:
                     seen_topic_ids.add(tid)
+
                 if tid != src_topic:
                     continue
 
             messages.append(message)
 
     except RPCError as e:
-        raise RuntimeError(str(e))
+        raise RuntimeError(str(e)) from e
 
     messages.reverse()
 
@@ -719,21 +456,23 @@ async def fetch_source_messages(source, src_topic, from_id, to_id):
 
     return messages
 
-
 # =========================================================
-# ACCESS CONTROL — only OWNER_ID can issue commands
+# OWNER CONTROL
 # =========================================================
 
 def owner_only(handler):
-    async def wrapper(update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user is None or update.effective_user.id != OWNER_ID:
+    async def wrapper(update, context):
+        user = update.effective_user
+
+        if user is None or user.id != OWNER_ID:
             return
-        await handler(update, context)
+
+        return await handler(update, context)
+
     return wrapper
 
-
 # =========================================================
-# COMMANDS (all via the Bot API — the transport we've confirmed works)
+# COMMANDS
 # =========================================================
 
 async def start_command(update, context):
@@ -749,18 +488,19 @@ async def start_command(update, context):
         "/reset\n"
         "/ping\n"
         "/uptime\n\n"
-        "Actual reading/sending aapke session-account se hoti hai — is bot "
-        "chat me commands sirf aapko (OWNER_ID) hi accept honge."
+        "Actual reading/sending aapke session-account se hoti hai — "
+        "is bot chat me commands sirf OWNER_ID ko accept hongi."
     )
 
-
 @owner_only
-async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
+async def clone_command(update, context):
     args = context.args
 
     if len(args) < 4:
         await update.effective_message.reply_text(
-            "Usage:\n/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]"
+            "Usage:\n"
+            "/clone Source Target From_ID To_ID "
+            "[Src_Topic_ID] [Tgt_Topic_ID]"
         )
         return
 
@@ -773,28 +513,42 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
         src_topic = int(args[4]) if len(args) > 4 else 0
         tgt_topic = int(args[5]) if len(args) > 5 else 0
     except ValueError:
-        await update.effective_message.reply_text("❌ IDs must be numbers.")
+        await update.effective_message.reply_text(
+            "❌ IDs must be numbers."
+        )
         return
 
-    status = await update.effective_message.reply_text("🔎 Source read kar raha hoon...")
+    if from_id > to_id:
+        from_id, to_id = to_id, from_id
+
+    status = await update.effective_message.reply_text(
+        "🔎 Source read kar raha hoon..."
+    )
 
     try:
-        messages = await fetch_source_messages(source, src_topic, from_id, to_id)
+        messages = await fetch_source_messages(
+            source, src_topic, from_id, to_id
+        )
     except Exception as e:
-        await status.edit_text(f"❌ Could not read source chat:\n{e}")
+        await status.edit_text(
+            f"❌ Could not read source chat:\n{e}"
+        )
         return
 
     if not messages:
         await status.edit_text(
             "⚠️ Is range/topic me koi message nahi mila.\n"
-            "Check karo: Src_Topic_ID sahi hai? Aapka session-account source ka member hai?"
+            "Check karo: Src_Topic_ID sahi hai? "
+            "Session-account source ka member hai?"
         )
         return
 
     try:
         await ensure_access(target)
     except Exception as e:
-        await status.edit_text(f"❌ Target access issue:\n{e}")
+        await status.edit_text(
+            f"❌ Target access issue:\n{e}"
+        )
         return
 
     success = 0
@@ -802,33 +556,70 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
     total = len(messages)
 
     for index, message_item in enumerate(messages, start=1):
+        result = None
+
         try:
-            result = await send_one(message_item, target, tgt_topic, CONFIG, source, src_topic)
-            if result:
-                save_mapping(source, src_topic, message_item.id, target, tgt_topic, result.id)
-                success += 1
-            else:
-                failed += 1
+            result = await send_one(
+                message_item,
+                target,
+                tgt_topic,
+                CONFIG,
+                source,
+                src_topic,
+            )
 
         except FloodWait as e:
-            await asyncio.sleep(e.value + 1)
+            wait_seconds = int(getattr(e, "value", 1)) + 1
+            print(
+                f"FloodWait: sleeping {wait_seconds}s",
+                flush=True,
+            )
+            await asyncio.sleep(wait_seconds)
+
             try:
-                result = await send_one(message_item, target, tgt_topic, CONFIG, source, src_topic)
-                if result:
-                    save_mapping(source, src_topic, message_item.id, target, tgt_topic, result.id)
-                    success += 1
-                else:
-                    failed += 1
+                result = await send_one(
+                    message_item,
+                    target,
+                    tgt_topic,
+                    CONFIG,
+                    source,
+                    src_topic,
+                )
             except Exception as retry_error:
-                failed += 1
-                print(f"Retry failed {message_item.id}: {retry_error}", flush=True)
+                print(
+                    f"Retry failed {message_item.id}: {retry_error}",
+                    flush=True,
+                )
 
         except Exception as e:
+            print(
+                f"Transfer error {message_item.id}: {e}",
+                flush=True,
+            )
+
+        if result:
+            try:
+                save_mapping(
+                    source,
+                    src_topic,
+                    message_item.id,
+                    target,
+                    tgt_topic,
+                    result.id,
+                )
+            except Exception as e:
+                print(
+                    f"Mapping save error {message_item.id}: {e}",
+                    flush=True,
+                )
+
+            success += 1
+        else:
             failed += 1
-            print(f"Transfer error {message_item.id}: {e}", flush=True)
 
         if index == 1 or index % 5 == 0 or index == total:
             percentage = index / total * 100
+
             try:
                 await status.edit_text(
                     "⏳ Bulk Transfer\n\n"
@@ -852,78 +643,121 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-
 @owner_only
 async def set_prefix_command(update, context):
     if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setprefix Your text\n(/setprefix - to clear)")
+        await update.effective_message.reply_text(
+            "Usage:\n/setprefix Your text\n"
+            "(/setprefix - to clear)"
+        )
         return
+
     value = update.effective_message.text.split(maxsplit=1)[1]
     CONFIG["prefix"] = "" if value.strip() == "-" else value
-    await update.effective_message.reply_text("✅ Prefix updated.")
 
+    await update.effective_message.reply_text(
+        "✅ Prefix updated."
+    )
 
 @owner_only
 async def set_suffix_command(update, context):
     if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setsuffix Your text\n(/setsuffix - to clear)")
+        await update.effective_message.reply_text(
+            "Usage:\n/setsuffix Your text\n"
+            "(/setsuffix - to clear)"
+        )
         return
+
     value = update.effective_message.text.split(maxsplit=1)[1]
     CONFIG["suffix"] = "" if value.strip() == "-" else value
-    await update.effective_message.reply_text("✅ Suffix updated.")
 
+    await update.effective_message.reply_text(
+        "✅ Suffix updated."
+    )
 
 @owner_only
 async def set_replace_command(update, context):
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage:\n/setreplace old | new\n(/setreplace - to clear)\n\n"
-            "⚠️ Text replace on hone par us message ki formatting preserve nahi hoti."
+            "Usage:\n/setreplace old | new\n"
+            "(/setreplace - to clear)\n\n"
+            "⚠️ Text replace on hone par formatting preserve nahi hoti."
         )
         return
+
     value = update.effective_message.text.split(maxsplit=1)[1]
 
     if value.strip() == "-":
         CONFIG["replace_from"] = ""
         CONFIG["replace_to"] = ""
-        await update.effective_message.reply_text("✅ Replacement cleared.")
+        await update.effective_message.reply_text(
+            "✅ Replacement cleared."
+        )
         return
 
     if " | " not in value:
-        await update.effective_message.reply_text("Usage:\n/setreplace old | new")
+        await update.effective_message.reply_text(
+            "Usage:\n/setreplace old | new"
+        )
         return
 
     old, new = value.split(" | ", 1)
     CONFIG["replace_from"] = old.strip()
     CONFIG["replace_to"] = new.strip()
-    await update.effective_message.reply_text("✅ Replacement configured.")
 
+    await update.effective_message.reply_text(
+        "✅ Replacement configured."
+    )
 
 @owner_only
 async def caption_mode_command(update, context):
-    if not context.args or context.args[0].lower() not in ("keep", "remove", "replace"):
-        await update.effective_message.reply_text("Usage:\n/captionmode keep|remove|replace")
+    if (
+        not context.args
+        or context.args[0].lower()
+        not in ("keep", "remove", "replace")
+    ):
+        await update.effective_message.reply_text(
+            "Usage:\n/captionmode keep|remove|replace"
+        )
         return
-    CONFIG["caption_mode"] = context.args[0].lower()
-    await update.effective_message.reply_text(f"✅ Caption mode set to: {CONFIG['caption_mode']}")
 
+    CONFIG["caption_mode"] = context.args[0].lower()
+
+    await update.effective_message.reply_text(
+        f"✅ Caption mode set to: {CONFIG['caption_mode']}"
+    )
 
 @owner_only
 async def set_caption_replace_command(update, context):
     if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setcaptionreplace old | new")
+        await update.effective_message.reply_text(
+            "Usage:\n/setcaptionreplace old | new"
+        )
         return
+
     value = update.effective_message.text.split(maxsplit=1)[1]
 
+    if value.strip() == "-":
+        CONFIG["caption_replace_from"] = ""
+        CONFIG["caption_replace_to"] = ""
+        await update.effective_message.reply_text(
+            "✅ Caption replacement cleared."
+        )
+        return
+
     if " | " not in value:
-        await update.effective_message.reply_text("Usage:\n/setcaptionreplace old | new")
+        await update.effective_message.reply_text(
+            "Usage:\n/setcaptionreplace old | new"
+        )
         return
 
     old, new = value.split(" | ", 1)
     CONFIG["caption_replace_from"] = old.strip()
     CONFIG["caption_replace_to"] = new.strip()
-    await update.effective_message.reply_text("✅ Caption replacement configured.")
 
+    await update.effective_message.reply_text(
+        "✅ Caption replacement configured."
+    )
 
 @owner_only
 async def status_command(update, context):
@@ -931,131 +765,157 @@ async def status_command(update, context):
         "📊 Settings\n\n"
         f"Prefix: {CONFIG['prefix'] or 'None'}\n"
         f"Suffix: {CONFIG['suffix'] or 'None'}\n"
-        f"Text Replace: {CONFIG['replace_from'] or 'None'} → {CONFIG['replace_to'] or 'None'}\n"
+        f"Text Replace: {CONFIG['replace_from'] or 'None'} → "
+        f"{CONFIG['replace_to'] or 'None'}\n"
         f"Caption Mode: {CONFIG['caption_mode']}\n"
-        f"Caption Replace: {CONFIG['caption_replace_from'] or 'None'} → "
+        f"Caption Replace: "
+        f"{CONFIG['caption_replace_from'] or 'None'} → "
         f"{CONFIG['caption_replace_to'] or 'None'}"
     )
-
 
 @owner_only
 async def reset_command(update, context):
     global CONFIG
     CONFIG = default_config()
-    await update.effective_message.reply_text("🔄 Configuration reset.")
 
+    await update.effective_message.reply_text(
+        "🔄 Configuration reset."
+    )
 
 def _format_uptime():
     delta = int(time.time() - START_TIME)
     days, rem = divmod(delta, 86400)
     hours, rem = divmod(rem, 3600)
     minutes, seconds = divmod(rem, 60)
+
     parts = []
+
     if days:
         parts.append(f"{days}d")
     if hours or days:
         parts.append(f"{hours}h")
     if minutes or hours or days:
         parts.append(f"{minutes}m")
+
     parts.append(f"{seconds}s")
     return " ".join(parts)
 
-
 async def ping_command(update, context):
     start = time.perf_counter()
-    msg = await update.effective_message.reply_text("🏓 Pinging...")
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    await msg.edit_text(f"🏓 Pong! `{elapsed_ms:.0f} ms`")
 
+    msg = await update.effective_message.reply_text(
+        "🏓 Pinging..."
+    )
+
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    await msg.edit_text(
+        f"🏓 Pong! `{elapsed_ms:.0f} ms`"
+    )
 
 async def uptime_command(update, context):
-    await update.effective_message.reply_text(f"⏱ Uptime: {_format_uptime()}")
-
+    await update.effective_message.reply_text(
+        f"⏱ Uptime: {_format_uptime()}"
+    )
 
 # =========================================================
-# WEB SERVER (health check for hosting platforms)
+# WEB SERVER
 # =========================================================
 
 async def home(request):
-    return web.Response(text=f"Running.\nUptime: {_format_uptime()}", status=200)
-
+    return web.Response(
+        text=f"Running.\nUptime: {_format_uptime()}",
+        status=200,
+    )
 
 async def start_web_server():
     web_app = web.Application()
     web_app.router.add_get("/", home)
+
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"HTTP server running on port {PORT}", flush=True)
 
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT,
+    )
+
+    await site.start()
+
+    print(
+        f"HTTP server running on port {PORT}",
+        flush=True,
+    )
 
 # =========================================================
 # MAIN
 # =========================================================
 
-def main():
-    init_db()
+async def run_bot():
+    ptb_app = Application.builder().token(BOT_TOKEN).build()
 
-    async def run_bot():
-        while True:
-            ptb_app = Application.builder().token(BOT_TOKEN).build()
-            ptb_app.add_handler(CommandHandler("start", start_command))
-            ptb_app.add_handler(CommandHandler("clone", clone_command))
-            ptb_app.add_handler(CommandHandler("setprefix", set_prefix_command))
-            ptb_app.add_handler(CommandHandler("setsuffix", set_suffix_command))
-            ptb_app.add_handler(CommandHandler("setreplace", set_replace_command))
-            ptb_app.add_handler(CommandHandler("captionmode", caption_mode_command))
-            ptb_app.add_handler(CommandHandler("setcaptionreplace", set_caption_replace_command))
-            ptb_app.add_handler(CommandHandler("status", status_command))
-            ptb_app.add_handler(CommandHandler("reset", reset_command))
-            ptb_app.add_handler(CommandHandler("ping", ping_command))
-            ptb_app.add_handler(CommandHandler("uptime", uptime_command))
+    ptb_app.add_handler(CommandHandler("start", start_command))
+    ptb_app.add_handler(CommandHandler("clone", clone_command))
+    ptb_app.add_handler(CommandHandler("setprefix", set_prefix_command))
+    ptb_app.add_handler(CommandHandler("setsuffix", set_suffix_command))
+    ptb_app.add_handler(CommandHandler("setreplace", set_replace_command))
+    ptb_app.add_handler(CommandHandler("captionmode", caption_mode_command))
+    ptb_app.add_handler(
+        CommandHandler(
+            "setcaptionreplace",
+            set_caption_replace_command,
+        )
+    )
+    ptb_app.add_handler(CommandHandler("status", status_command))
+    ptb_app.add_handler(CommandHandler("reset", reset_command))
+    ptb_app.add_handler(CommandHandler("ping", ping_command))
+    ptb_app.add_handler(CommandHandler("uptime", uptime_command))
 
-            try:
-                await ptb_app.initialize()
-                await ptb_app.bot.delete_webhook(drop_pending_updates=True)
-                await ptb_app.start()
-                await ptb_app.updater.start_polling(drop_pending_updates=True)
-                print("Bot polling started — all commands active.", flush=True)
+    await ptb_app.initialize()
+    await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+    await ptb_app.start()
+    await ptb_app.updater.start_polling(drop_pending_updates=True)
 
-                while ptb_app.updater.running:
-                    await asyncio.sleep(5)
-
-            except Exception as e:
-                print(f"Bot error: {e}", flush=True)
-
-            finally:
-                try:
-                    if ptb_app.updater.running:
-                        await ptb_app.updater.stop()
-                except Exception:
-                    pass
-                try:
-                    await ptb_app.stop()
-                    await ptb_app.shutdown()
-                except Exception:
-                    pass
-
-            print("Bot restarting in 15s...", flush=True)
-            await asyncio.sleep(15)
-
-    async def run():
-        await app.start()
-        me = await app.get_me()
-        print(f"Userbot session online: {me.first_name} (@{me.username})", flush=True)
-
-        await start_web_server()
-        await run_bot()
+    print(
+        "Bot polling started — all commands active.",
+        flush=True,
+    )
 
     try:
-        asyncio.run(run())
+        while True:
+            await asyncio.sleep(10)
     finally:
         try:
-            asyncio.run(app.stop())
+            await ptb_app.updater.stop()
         except Exception:
             pass
 
+        try:
+            await ptb_app.stop()
+        except Exception:
+            pass
+
+        try:
+            await ptb_app.shutdown()
+        except Exception:
+            pass
+
+async def run():
+    init_db()
+
+    await app.start()
+
+    me = await app.get_me()
+
+    print(
+        f"Userbot session online: "
+        f"{me.first_name} (@{me.username})",
+        flush=True,
+    )
+
+    await start_web_server()
+    await run_bot()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
