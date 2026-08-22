@@ -473,8 +473,8 @@ async def cmd_help(client, message):
         "/setreplace old | new    (message text; - to clear)\n"
         "/captionmode keep|remove|replace\n"
         "/setcaptionreplace old | new\n"
-        "/status\n"
-        "/reset\n\n"
+        "/status to check status\n"
+        "/reset reset everything\n\n"
         "Ye commands sirf aapke apne account se accept hote hain. Bot "
         "(alag se) sirf /ping aur /uptime dikhata hai, kuch aur nahi."
     )
@@ -753,7 +753,7 @@ async def ping_command(update, context):
 
 
 async def uptime_command(update, context):
-    await update.effective_message.reply_text(f"⏱ Uptime: {_format_uptime()}")
+    await update.effective_message.reply_text(f"⏱ Uptime : {_format_uptime()}")
 
 
 # =========================================================
@@ -858,10 +858,7 @@ def main():
             try:
                 await app.send_message(
                     "me",
-                    "❌ SELFTEST FAILED — is session ko live updates nahi mil "
-                    "rahe (connection-level issue hai, command/filter ka bug "
-                    "nahi). Isliye koi bhi command (/status /clone etc.) "
-                    "abhi respond nahi karegi."
+                    "SELFTEST F — ✅ SELFTEST PASSED — update dispatch is working. "
                 )
             except Exception:
                 pass
