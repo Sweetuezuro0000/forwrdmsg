@@ -793,15 +793,25 @@ def main():
 
         await app.send_message("me", "__SELFTEST__")
         try:
-            await asyncio.wait_for(self_test_event.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            print(
-                "[SELFTEST] FAIL — this session is NOT receiving live updates "
-                "at all. This is a connection-level issue, not a command/filter "
-                "bug. All /clone etc. commands will not respond until this is "
-                "fixed.",
-                flush=True,
+            await asyncio.wait_for(self_test_event.wait(), timeout=20)
+            await app.send_message(
+                "me",
+                "✅ SELFTEST PASSED — update dispatch is working. "
+                "Ab /help, /status, /clone jaisi commands yahi (Saved Messages) "
+                "me kaam karengi."
             )
+        except asyncio.TimeoutError:
+            print("[SELFTEST] FAIL — no live updates received.", flush=True)
+            try:
+                await app.send_message(
+                    "me",
+                    "❌ SELFTEST FAILED — is session ko live updates nahi mil "
+                    "rahe (connection-level issue hai, command/filter ka bug "
+                    "nahi). Isliye koi bhi command (/status /clone etc.) "
+                    "abhi respond nahi karegi."
+                )
+            except Exception:
+                pass
 
         await start_web_server()
 
