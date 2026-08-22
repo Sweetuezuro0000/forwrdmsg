@@ -12,6 +12,28 @@ from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait, RPCError
+import pyrogram.utils as _pyroutils
+
+
+# =========================================================
+# PATCH: pyrogram 2.0.106 has outdated MIN_CHANNEL_ID/MIN_CHAT_ID range
+# constants, so it raises "Peer id invalid" for newer (larger) channel
+# IDs Telegram now issues. That crash kills processing of the WHOLE
+# incoming update batch — silently dropping any other messages bundled
+# in it, including our own commands. This replaces the range-check with
+# a simple, future-proof format check (well-documented community fix).
+# =========================================================
+
+def _patched_get_peer_type(peer_id: int) -> str:
+    peer_id_str = str(peer_id)
+    if not peer_id_str.startswith("-"):
+        return "user"
+    if peer_id_str.startswith("-100"):
+        return "channel"
+    return "chat"
+
+
+_pyroutils.get_peer_type = _patched_get_peer_type
 
 from telegram.ext import Application, CommandHandler
 
