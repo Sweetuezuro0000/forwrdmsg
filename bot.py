@@ -35,6 +35,26 @@ def _patched_get_peer_type(peer_id: int) -> str:
 
 _pyroutils.get_peer_type = _patched_get_peer_type
 
+
+def _patch_handle_updates_safety(client_cls):
+    """Belt-and-suspenders: no matter WHAT goes wrong while processing one
+    incoming update batch (unresolvable peer, rare RPC edge case, etc.),
+    it must never abort the whole batch — which was silently dropping
+    unrelated messages (including our own commands) bundled alongside
+    the problematic one."""
+    original = client_cls.handle_updates
+
+    async def safe_handle_updates(self, updates):
+        try:
+            return await original(self, updates)
+        except Exception as e:
+            print(f"[handle_updates] suppressed crash: {e}", flush=True)
+
+    client_cls.handle_updates = safe_handle_updates
+
+
+_patch_handle_updates_safety(Client)
+
 from telegram.ext import Application, CommandHandler
 
 
