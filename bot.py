@@ -55,6 +55,17 @@ def _patch_handle_updates_safety(client_cls):
 
 _patch_handle_updates_safety(Client)
 
+# Pyrogram/kurigram binds itself to whatever event loop is "current" at the
+# moment the Client object is constructed. Since we build the Client at
+# module import time (before asyncio.run() creates its own loop), Python
+# 3.13's stricter loop handling causes a "attached to a different loop"
+# crash the first time it tries to use that mismatched loop. Fix: create
+# and set our OWN loop right now, then drive the whole program with that
+# exact same loop object (see main(), which uses run_until_complete on
+# this loop instead of asyncio.run()).
+_MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_MAIN_LOOP)
+
 from telegram.ext import Application, CommandHandler
 
 
@@ -863,10 +874,10 @@ def main():
         await asyncio.Event().wait()
 
     try:
-        asyncio.run(run())
+        _MAIN_LOOP.run_until_complete(run())
     finally:
         try:
-            asyncio.run(app.stop())
+            _MAIN_LOOP.run_until_complete(app.stop())
         except Exception:
             pass
 
