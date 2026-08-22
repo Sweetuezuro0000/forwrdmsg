@@ -4,14 +4,16 @@ import copy
 import time
 import sqlite3
 import asyncio
+import traceback
 
 from aiohttp import web
 
-from pyrogram import Client
+from pyrogram import Client, filters
+from pyrogram.handlers import MessageHandler
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait, RPCError
 
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
 
 # =========================================================
@@ -20,17 +22,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]   # your account — reads source, sends to target
+SESSION_STRING = os.environ["SESSION_STRING"]   # your account — does EVERYTHING
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]             # all commands (incl. /clone) go through this bot
-OWNER_ID = int(os.environ["OWNER_ID"])          # your numeric Telegram user id — only you can command it
+BOT_TOKEN = os.environ["BOT_TOKEN"]             # used ONLY for /ping and /uptime
 PORT = int(os.environ.get("PORT", "10000"))
 
 START_TIME = time.time()
 
 
 # =========================================================
-# CONFIG (single owner)
+# CONFIG
 # =========================================================
 
 def default_config():
@@ -105,7 +106,8 @@ def get_mapping(source_chat, source_topic, source_msg_id):
 
 
 # =========================================================
-# PYROGRAM CLIENT — YOUR ACCOUNT. Reads source AND sends to target.
+# PYROGRAM CLIENT — YOUR ACCOUNT. Reads source, sends to target,
+# AND receives your control commands. This is the only thing doing work.
 # =========================================================
 
 app = Client(
@@ -285,7 +287,7 @@ def process_text_or_caption(raw_text, entities, config, source_chat, source_topi
 
 
 # =========================================================
-# SENDING (same client that read the message — file_ids stay valid)
+# SENDING
 # =========================================================
 
 async def send_text_message(message, target_chat, target_topic, config,
@@ -400,35 +402,18 @@ async def fetch_source_messages(source, src_topic, from_id, to_id):
 
 
 # =========================================================
-# ACCESS CONTROL — only OWNER_ID can issue commands
+# CONTROL COMMANDS — sent from YOUR OWN account only (Saved Messages,
+# or any chat). filters.me guarantees no one else can trigger these.
+#
+# IMPORTANT: each command handler is its own decorated function in its
+# own dispatch group, so one handler can never block another from running
+# (this was the earlier bug — two handlers sharing a group only let the
+# first one fire).
 # =========================================================
 
-def owner_only(handler):
-    async def wrapper(update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if user is None or user.id != OWNER_ID:
-            # Self-diagnosing: instead of staying silent, tell them exactly
-            # what ID to put in OWNER_ID so this stops happening.
-            if user is not None:
-                await update.effective_message.reply_text(
-                    "⛔ Ye command aapke liye disabled hai.\n\n"
-                    f"Aapki Telegram user ID: `{user.id}`\n"
-                    f"Deploy me set kiya OWNER_ID: `{OWNER_ID}`\n\n"
-                    "Ye dono match nahi kar rahe. env vars me OWNER_ID "
-                    f"ko `{user.id}` set karo aur redeploy karo."
-                )
-            return
-        await handler(update, context)
-    return wrapper
-
-
-# =========================================================
-# COMMANDS (all via the Bot API — the transport we've confirmed works)
-# =========================================================
-
-async def start_command(update, context):
-    await update.effective_message.reply_text(
-        "🚀 Bulk Transfer Bot\n\n"
+async def cmd_help(client, message):
+    await message.reply_text(
+        "🚀 Userbot Transfer Control\n\n"
         "/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]\n\n"
         "/setprefix text          (- to clear)\n"
         "/setsuffix text          (- to clear)\n"
@@ -436,20 +421,17 @@ async def start_command(update, context):
         "/captionmode keep|remove|replace\n"
         "/setcaptionreplace old | new\n"
         "/status\n"
-        "/reset\n"
-        "/ping\n"
-        "/uptime\n\n"
-        "Actual reading/sending aapke session-account se hoti hai — is bot "
-        "chat me commands sirf aapko (OWNER_ID) hi accept honge."
+        "/reset\n\n"
+        "Ye commands sirf aapke apne account se accept hote hain. Bot "
+        "(alag se) sirf /ping aur /uptime dikhata hai, kuch aur nahi."
     )
 
 
-@owner_only
-async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
+async def cmd_clone(client, message):
+    args = message.command[1:]
 
     if len(args) < 4:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Usage:\n/clone Source Target From_ID To_ID [Src_Topic_ID] [Tgt_Topic_ID]"
         )
         return
@@ -463,10 +445,10 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
         src_topic = int(args[4]) if len(args) > 4 else 0
         tgt_topic = int(args[5]) if len(args) > 5 else 0
     except ValueError:
-        await update.effective_message.reply_text("❌ IDs must be numbers.")
+        await message.reply_text("❌ IDs must be numbers.")
         return
 
-    status = await update.effective_message.reply_text("🔎 Source read kar raha hoon...")
+    status = await message.reply_text("🔎 Source read kar raha hoon...")
 
     try:
         messages = await fetch_source_messages(source, src_topic, from_id, to_id)
@@ -477,7 +459,7 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
     if not messages:
         await status.edit_text(
             "⚠️ Is range/topic me koi message nahi mila.\n"
-            "Check karo: Src_Topic_ID sahi hai? Aapka session-account source ka member hai?"
+            "Check karo: Src_Topic_ID sahi hai? Aapka account source ka member hai?"
         )
         return
 
@@ -516,6 +498,7 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             failed += 1
             print(f"Transfer error {message_item.id}: {e}", flush=True)
+            traceback.print_exc()
 
         if index == 1 or index % 5 == 0 or index == total:
             percentage = index / total * 100
@@ -543,81 +526,80 @@ async def clone_command(update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-@owner_only
-async def set_prefix_command(update, context):
-    if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setprefix Your text\n(/setprefix - to clear)")
+async def cmd_set_prefix(client, message):
+    args = message.command[1:]
+    if not args:
+        await message.reply_text("Usage:\n/setprefix Your text\n(/setprefix - to clear)")
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
+    value = message.text.split(maxsplit=1)[1]
     CONFIG["prefix"] = "" if value.strip() == "-" else value
-    await update.effective_message.reply_text("✅ Prefix updated.")
+    await message.reply_text("✅ Prefix updated.")
 
 
-@owner_only
-async def set_suffix_command(update, context):
-    if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setsuffix Your text\n(/setsuffix - to clear)")
+async def cmd_set_suffix(client, message):
+    args = message.command[1:]
+    if not args:
+        await message.reply_text("Usage:\n/setsuffix Your text\n(/setsuffix - to clear)")
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
+    value = message.text.split(maxsplit=1)[1]
     CONFIG["suffix"] = "" if value.strip() == "-" else value
-    await update.effective_message.reply_text("✅ Suffix updated.")
+    await message.reply_text("✅ Suffix updated.")
 
 
-@owner_only
-async def set_replace_command(update, context):
-    if not context.args:
-        await update.effective_message.reply_text(
+async def cmd_set_replace(client, message):
+    args = message.command[1:]
+    if not args:
+        await message.reply_text(
             "Usage:\n/setreplace old | new\n(/setreplace - to clear)\n\n"
             "⚠️ Text replace on hone par us message ki formatting preserve nahi hoti."
         )
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
+    value = message.text.split(maxsplit=1)[1]
 
     if value.strip() == "-":
         CONFIG["replace_from"] = ""
         CONFIG["replace_to"] = ""
-        await update.effective_message.reply_text("✅ Replacement cleared.")
+        await message.reply_text("✅ Replacement cleared.")
         return
 
     if " | " not in value:
-        await update.effective_message.reply_text("Usage:\n/setreplace old | new")
+        await message.reply_text("Usage:\n/setreplace old | new")
         return
 
     old, new = value.split(" | ", 1)
     CONFIG["replace_from"] = old.strip()
     CONFIG["replace_to"] = new.strip()
-    await update.effective_message.reply_text("✅ Replacement configured.")
+    await message.reply_text("✅ Replacement configured.")
 
 
-@owner_only
-async def caption_mode_command(update, context):
-    if not context.args or context.args[0].lower() not in ("keep", "remove", "replace"):
-        await update.effective_message.reply_text("Usage:\n/captionmode keep|remove|replace")
+async def cmd_caption_mode(client, message):
+    args = message.command[1:]
+    if not args or args[0].lower() not in ("keep", "remove", "replace"):
+        await message.reply_text("Usage:\n/captionmode keep|remove|replace")
         return
-    CONFIG["caption_mode"] = context.args[0].lower()
-    await update.effective_message.reply_text(f"✅ Caption mode set to: {CONFIG['caption_mode']}")
+    CONFIG["caption_mode"] = args[0].lower()
+    await message.reply_text(f"✅ Caption mode set to: {CONFIG['caption_mode']}")
 
 
-@owner_only
-async def set_caption_replace_command(update, context):
-    if not context.args:
-        await update.effective_message.reply_text("Usage:\n/setcaptionreplace old | new")
+async def cmd_set_caption_replace(client, message):
+    args = message.command[1:]
+    if not args:
+        await message.reply_text("Usage:\n/setcaptionreplace old | new")
         return
-    value = update.effective_message.text.split(maxsplit=1)[1]
+    value = message.text.split(maxsplit=1)[1]
 
     if " | " not in value:
-        await update.effective_message.reply_text("Usage:\n/setcaptionreplace old | new")
+        await message.reply_text("Usage:\n/setcaptionreplace old | new")
         return
 
     old, new = value.split(" | ", 1)
     CONFIG["caption_replace_from"] = old.strip()
     CONFIG["caption_replace_to"] = new.strip()
-    await update.effective_message.reply_text("✅ Caption replacement configured.")
+    await message.reply_text("✅ Caption replacement configured.")
 
 
-@owner_only
-async def status_command(update, context):
-    await update.effective_message.reply_text(
+async def cmd_status(client, message):
+    await message.reply_text(
         "📊 Settings\n\n"
         f"Prefix: {CONFIG['prefix'] or 'None'}\n"
         f"Suffix: {CONFIG['suffix'] or 'None'}\n"
@@ -628,12 +610,58 @@ async def status_command(update, context):
     )
 
 
-@owner_only
-async def reset_command(update, context):
+async def cmd_reset(client, message):
     global CONFIG
     CONFIG = default_config()
-    await update.effective_message.reply_text("🔄 Configuration reset.")
+    await message.reply_text("🔄 Configuration reset.")
 
+
+def _wrap(handler):
+    """Every command runs in isolation: an error in one handler is caught
+    and reported back in Telegram — it can never silently swallow other
+    commands or crash the client."""
+    async def wrapped(client, message):
+        try:
+            await handler(client, message)
+        except Exception as e:
+            print(f"[ERROR] command failed: {e}", flush=True)
+            traceback.print_exc()
+            try:
+                await message.reply_text(f"❌ Error:\n`{e}`")
+            except Exception:
+                pass
+    return wrapped
+
+
+# Each command gets its OWN handler + OWN dispatch group so none of them
+# can ever block one another.
+_COMMANDS = [
+    ("help", cmd_help),
+    ("clone", cmd_clone),
+    ("setprefix", cmd_set_prefix),
+    ("setsuffix", cmd_set_suffix),
+    ("setreplace", cmd_set_replace),
+    ("captionmode", cmd_caption_mode),
+    ("setcaptionreplace", cmd_set_caption_replace),
+    ("status", cmd_status),
+    ("reset", cmd_reset),
+]
+
+for group_index, (cmd_name, cmd_fn) in enumerate(_COMMANDS):
+    app.add_handler(
+        MessageHandler(
+            _wrap(cmd_fn),
+            filters.me & filters.command(cmd_name, prefixes=["/", "."]),
+        ),
+        group=group_index,
+    )
+
+
+# =========================================================
+# STATUS BOT — ONLY /ping and /uptime. Fully isolated: if this ever
+# crashes (e.g. token conflict), it retries on its own and NEVER touches
+# the userbot / your control commands above.
+# =========================================================
 
 def _format_uptime():
     delta = int(time.time() - START_TIME)
@@ -687,33 +715,26 @@ async def start_web_server():
 def main():
     init_db()
 
-    async def run_bot():
+    async def run_status_bot():
+        """Isolated /ping /uptime bot. Any failure here (e.g. a stray
+        duplicate poller during a redeploy) is contained to this loop and
+        retried — it can never affect the userbot control commands."""
         while True:
             ptb_app = Application.builder().token(BOT_TOKEN).build()
-            ptb_app.add_handler(CommandHandler("start", start_command))
-            ptb_app.add_handler(CommandHandler("clone", clone_command))
-            ptb_app.add_handler(CommandHandler("setprefix", set_prefix_command))
-            ptb_app.add_handler(CommandHandler("setsuffix", set_suffix_command))
-            ptb_app.add_handler(CommandHandler("setreplace", set_replace_command))
-            ptb_app.add_handler(CommandHandler("captionmode", caption_mode_command))
-            ptb_app.add_handler(CommandHandler("setcaptionreplace", set_caption_replace_command))
-            ptb_app.add_handler(CommandHandler("status", status_command))
-            ptb_app.add_handler(CommandHandler("reset", reset_command))
             ptb_app.add_handler(CommandHandler("ping", ping_command))
             ptb_app.add_handler(CommandHandler("uptime", uptime_command))
-
             try:
                 await ptb_app.initialize()
                 await ptb_app.bot.delete_webhook(drop_pending_updates=True)
                 await ptb_app.start()
                 await ptb_app.updater.start_polling(drop_pending_updates=True)
-                print("Bot polling started — all commands active.", flush=True)
+                print("Status bot (/ping, /uptime) polling started.", flush=True)
 
                 while ptb_app.updater.running:
                     await asyncio.sleep(5)
 
             except Exception as e:
-                print(f"Bot error: {e}", flush=True)
+                print(f"Status bot error: {e}", flush=True)
 
             finally:
                 try:
@@ -727,7 +748,7 @@ def main():
                 except Exception:
                     pass
 
-            print("Bot restarting in 15s...", flush=True)
+            print("Status bot restarting in 15s...", flush=True)
             await asyncio.sleep(15)
 
     async def run():
@@ -735,8 +756,21 @@ def main():
         me = await app.get_me()
         print(f"Userbot session online: {me.first_name} (@{me.username})", flush=True)
 
+        # Populate the peer cache for every chat this account is in. Without
+        # this, an in-memory session doesn't know how to resolve incoming
+        # updates for channels/groups it hasn't explicitly fetched yet,
+        # which is what caused the "Peer id invalid" warnings.
+        dialog_count = 0
+        async for _ in app.get_dialogs():
+            dialog_count += 1
+        print(f"Peer cache warmed up: {dialog_count} chats.", flush=True)
+
         await start_web_server()
-        await run_bot()
+
+        # Status bot is a background task — isolated, can't affect the userbot.
+        asyncio.create_task(run_status_bot())
+
+        await asyncio.Event().wait()
 
     try:
         asyncio.run(run())
