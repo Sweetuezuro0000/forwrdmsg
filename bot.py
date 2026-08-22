@@ -778,6 +778,31 @@ def main():
             dialog_count += 1
         print(f"Peer cache warmed up: {dialog_count} chats.", flush=True)
 
+        # ---- SELF-TEST: does the update dispatcher actually deliver
+        # incoming messages to our handlers at all? This removes any
+        # dependency on manually testing via Telegram — it proves or
+        # disproves update delivery automatically, right here in the logs.
+        self_test_event = asyncio.Event()
+
+        async def _self_test_handler(c, m):
+            if m.text == "__SELFTEST__":
+                print("[SELFTEST] PASS — update dispatch is working.", flush=True)
+                self_test_event.set()
+
+        app.add_handler(MessageHandler(_self_test_handler, filters.me), group=-2000)
+
+        await app.send_message("me", "__SELFTEST__")
+        try:
+            await asyncio.wait_for(self_test_event.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            print(
+                "[SELFTEST] FAIL — this session is NOT receiving live updates "
+                "at all. This is a connection-level issue, not a command/filter "
+                "bug. All /clone etc. commands will not respond until this is "
+                "fixed.",
+                flush=True,
+            )
+
         await start_web_server()
 
         # Status bot is a background task — isolated, can't affect the userbot.
