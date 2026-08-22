@@ -657,6 +657,19 @@ for group_index, (cmd_name, cmd_fn) in enumerate(_COMMANDS):
     )
 
 
+async def _debug_all(client, message):
+    print(
+        f"[DEBUG] update received | chat={message.chat.id} "
+        f"from={getattr(message.from_user, 'id', None)} "
+        f"is_self={getattr(message.from_user, 'is_self', None)} "
+        f"text={message.text!r}",
+        flush=True,
+    )
+
+
+app.add_handler(MessageHandler(_debug_all, filters.all), group=-1000)
+
+
 # =========================================================
 # STATUS BOT — ONLY /ping and /uptime. Fully isolated: if this ever
 # crashes (e.g. token conflict), it retries on its own and NEVER touches
